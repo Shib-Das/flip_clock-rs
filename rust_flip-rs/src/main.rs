@@ -8,37 +8,50 @@ use sdl2::video::Window;
 use sdl2::gfx::primitives::DrawRenderer;
 use chrono::{Local, Timelike};
 
-fn draw_card(
-    canvas: &mut Canvas<Window>,
-    texture: &Texture,
-    x: i16,
-    y: i16,
-    width: i16,
-    height: i16,
-) -> Result<(), String> {
-    // Draw dark grey rounded rectangle
-    canvas.rounded_box(x, y, x + width, y + height, 10, Color::RGB(40, 40, 40))?;
+struct FlipClockRenderer<'a> {
+    digit_textures: Vec<Texture<'a>>,
+    card_width: i16,
+    card_height: i16,
+}
 
-    let sdl2::render::TextureQuery { width: w, height: h, .. } = texture.query();
+impl<'a> FlipClockRenderer<'a> {
+    fn draw_card(
+        &self,
+        canvas: &mut Canvas<Window>,
+        x: i16,
+        y: i16,
+        number: u32,
+    ) -> Result<(), String> {
+        let width = self.card_width;
+        let height = self.card_height;
 
-    // Center text on the card
-    let center_x = x as i32 + width as i32 / 2;
-    let center_y = y as i32 + height as i32 / 2;
+        // Draw dark grey rounded rectangle
+        canvas.rounded_box(x, y, x + width, y + height, 10, Color::RGB(40, 40, 40))?;
 
-    let target = Rect::new(
-        center_x - w as i32 / 2,
-        center_y - h as i32 / 2,
-        w,
-        h
-    );
-    canvas.copy(texture, None, target)?;
+        // Retrieve the pre-rendered texture for the number
+        let texture = &self.digit_textures[number as usize];
 
-    // Draw horizontal split line (thick black line)
-    let mid_y = y + height / 2;
-    // box_ coordinates are inclusive
-    canvas.box_(x, mid_y - 2, x + width, mid_y + 2, Color::BLACK)?;
+        let sdl2::render::TextureQuery { width: w, height: h, .. } = texture.query();
 
-    Ok(())
+        // Center text on the card
+        let center_x = x as i32 + width as i32 / 2;
+        let center_y = y as i32 + height as i32 / 2;
+
+        let target = Rect::new(
+            center_x - w as i32 / 2,
+            center_y - h as i32 / 2,
+            w,
+            h
+        );
+        canvas.copy(texture, None, target)?;
+
+        // Draw horizontal split line (thick black line)
+        let mid_y = y + height / 2;
+        // box_ coordinates are inclusive
+        canvas.box_(x, mid_y - 2, x + width, mid_y + 2, Color::BLACK)?;
+
+        Ok(())
+    }
 }
 
 fn run_screensaver() {
@@ -72,10 +85,14 @@ fn run_screensaver() {
     }
 
     // Dynamically calculate font size based on screen height
-    let (_, screen_height) = canvas.output_size().unwrap();
+    let (w_u32, h_u32) = canvas.output_size().unwrap();
+
     // Card height is 40% of screen height
+    let card_height = (h_u32 as f32 * 0.4) as i16;
+    let card_width = (w_u32 as f32 * 0.15) as i16;
+
     // Font size should be slightly smaller than card height, say 80% of card height
-    let font_size = (screen_height as f32 * 0.4 * 0.8) as u16;
+    let font_size = (card_height as f32 * 0.8) as u16;
 
     let font = ttf_context.load_font(&font_path, font_size).expect("Failed to load font. Make sure assets/fonts/Roboto-Bold.ttf exists.");
 
@@ -91,10 +108,25 @@ fn run_screensaver() {
         digit_textures.push(texture);
     }
 
+    let renderer = FlipClockRenderer {
+        digit_textures,
+        card_width,
+        card_height,
+    };
+
     let mut event_pump = sdl_context.event_pump().unwrap();
     let mouse_state = event_pump.mouse_state();
     let initial_x = mouse_state.x();
     let initial_y = mouse_state.y();
+
+    // Layout calculations
+    let w = w_u32 as i16;
+    let h = h_u32 as i16;
+    let spacing = (w_u32 as f32 * 0.02) as i16;
+    let group_gap = spacing * 3;
+    let total_width = 4 * card_width + 2 * spacing + group_gap;
+    let start_x = (w - total_width) / 2;
+    let start_y = (h - card_height) / 2;
 
     'running: loop {
         for event in event_pump.poll_iter() {
@@ -125,27 +157,10 @@ fn run_screensaver() {
 
         let digits = [h1, h2, m1, m2];
 
-        let (w_u32, h_u32) = canvas.output_size().unwrap();
-        let w = w_u32 as i16;
-        let h = h_u32 as i16;
-
-        // Layout
-        let card_width = (w_u32 as f32 * 0.15) as i16;
-        let card_height = (h_u32 as f32 * 0.4) as i16;
-        let spacing = (w_u32 as f32 * 0.02) as i16;
-
-        let group_gap = spacing * 3;
-        let total_width = 4 * card_width + 2 * spacing + group_gap;
-
-        let start_x = (w - total_width) / 2;
-        let start_y = (h - card_height) / 2;
-
         let mut x_offset = start_x;
 
         for (i, &digit) in digits.iter().enumerate() {
-            // Use cached texture
-            let texture = &digit_textures[digit as usize];
-            draw_card(&mut canvas, texture, x_offset, start_y, card_width, card_height).unwrap();
+            renderer.draw_card(&mut canvas, x_offset, start_y, digit).unwrap();
 
             x_offset += card_width + spacing;
             if i == 1 {
