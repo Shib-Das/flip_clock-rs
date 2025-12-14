@@ -1,8 +1,12 @@
 [package]
-name = "rust_flip-rs"
+name = "flip_clock_rs"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "rust_flip_clock"
+path = "src/main.rs"
+
 [dependencies]
+macroquad = "0.4"
 chrono = "0.4"
-sdl2 = { version = "0.35", features = ["ttf", "gfx"] }
