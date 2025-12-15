@@ -7,12 +7,15 @@ use std::path::PathBuf;
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AppConfig {
     pub selected_monitor: String, // Identify by name
+    #[serde(default)]
+    pub pixelated: bool,
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
             selected_monitor: String::new(),
+            pixelated: false,
         }
     }
 }
@@ -54,18 +57,22 @@ mod tests {
     fn test_config_serialization() {
         let config = AppConfig {
             selected_monitor: "TestMonitor".to_string(),
+            pixelated: true,
         };
 
         let json = serde_json::to_string(&config).unwrap();
         assert!(json.contains("TestMonitor"));
+        assert!(json.contains("pixelated"));
 
         let loaded: AppConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(loaded.selected_monitor, "TestMonitor");
+        assert_eq!(loaded.pixelated, true);
     }
 
     #[test]
     fn test_default_config() {
         let config = AppConfig::default();
         assert_eq!(config.selected_monitor, "");
+        assert_eq!(config.pixelated, false);
     }
 }
