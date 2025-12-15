@@ -13,7 +13,7 @@ mod windows_utils {
         SetWindowPos, SetWindowLongW, GetWindowLongW, HWND_TOP, SWP_SHOWWINDOW,
         GWL_STYLE, WS_POPUP, WS_VISIBLE, GetForegroundWindow
     };
-    use winapi::shared::windef::{HMONITOR, HDC, LPRECT, HWND, RECT};
+    use winapi::shared::windef::{HMONITOR, HDC, LPRECT, HWND};
     use winapi::shared::minwindef::{BOOL, LPARAM, TRUE};
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
@@ -90,7 +90,7 @@ mod windows_utils {
 
             // Remove borders and make popup
             let style = GetWindowLongW(hwnd, GWL_STYLE);
-            SetWindowLongW(hwnd, GWL_STYLE, (style & !winapi::um::winuser::WS_OVERLAPPEDWINDOW) | WS_POPUP | WS_VISIBLE as i32);
+            SetWindowLongW(hwnd, GWL_STYLE, ((style as u32 & !winapi::um::winuser::WS_OVERLAPPEDWINDOW) | WS_POPUP | WS_VISIBLE) as i32);
 
             let v_rect = get_virtual_screen_rect();
             SetWindowPos(
@@ -167,7 +167,7 @@ async fn main() {
             AppMode::Clock { preview } => {
                 if run_clock(preview).await {
                     // if run_clock returns true, it means we want to return to setup (only from preview)
-                    mode = AppMode::Setup;
+                    // mode = AppMode::Setup;
                     // Restore window size? Macroquad window might be stuck at full screen size.
                     // This is tricky. Usually we just exit.
                     // But for "Try it out", we might want to restart the loop.
