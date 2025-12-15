@@ -140,7 +140,15 @@ enum AppMode {
     Setup,
 }
 
-#[macroquad::main("Flip Clock")]
+fn window_conf() -> Conf {
+    Conf {
+        window_title: "Flip Clock".to_owned(),
+        high_dpi: true,
+        ..Default::default()
+    }
+}
+
+#[macroquad::main(window_conf)]
 async fn main() {
     let args: Vec<String> = env::args().collect();
     let mut mode = AppMode::Setup; // Default to setup if no args
@@ -196,9 +204,30 @@ async fn run_setup() -> Option<AppMode> {
     let mut config = load_config();
     let monitors = windows_utils::get_monitors();
     let mut install_status = String::new();
+    let mut selected_index = 0;
+
+    // Items: Monitors... , Pixelated Toggle, Try It Out, Install
+    let num_monitors = monitors.len();
+    let total_items = num_monitors + 3;
 
     loop {
         clear_background(LIGHTGRAY);
+
+        // Keyboard navigation
+        if is_key_pressed(KeyCode::Up) {
+            if selected_index > 0 {
+                selected_index -= 1;
+            } else {
+                selected_index = total_items - 1;
+            }
+        }
+        if is_key_pressed(KeyCode::Down) {
+            if selected_index < total_items - 1 {
+                selected_index += 1;
+            } else {
+                selected_index = 0;
+            }
+        }
 
         let mut y = 20.0;
         draw_text("Flip Clock Setup", 20.0, y + 20.0, 40.0, BLACK);
@@ -207,27 +236,36 @@ async fn run_setup() -> Option<AppMode> {
         draw_text("Select Display:", 20.0, y, 30.0, DARKGRAY);
         y += 40.0;
 
-        for m in &monitors {
-             let is_selected = if config.selected_monitor.is_empty() {
+        // Monitors
+        for (i, m) in monitors.iter().enumerate() {
+             let is_configured = if config.selected_monitor.is_empty() {
                  m.is_primary
              } else {
                  m.name == config.selected_monitor
              };
 
-             let color = if is_selected { DARKBLUE } else { BLACK };
-             let prefix = if is_selected { "[x] " } else { "[ ] " };
+             let is_highlighted = i == selected_index;
+             let color = if is_highlighted { RED } else { BLACK }; // Highlight color
+             let check = if is_configured { "[x] " } else { "[ ] " };
              let primary_text = if m.is_primary { " (Primary)" } else { "" };
-             let text = format!("{}{}{}", prefix, m.name, primary_text);
+             let text = format!("{}{}{}", check, m.name, primary_text);
 
              let text_dims = measure_text(&text, None, 20, 1.0);
              let rect = Rect::new(40.0, y - 15.0, text_dims.width, 25.0);
 
-             if is_mouse_button_pressed(MouseButton::Left) {
-                 let mpos = mouse_position();
-                 if rect.contains(vec2(mpos.0, mpos.1)) {
+             // Mouse interaction
+             if rect.contains(vec2(mouse_position().0, mouse_position().1)) {
+                 if is_mouse_button_pressed(MouseButton::Left) {
                      config.selected_monitor = m.name.clone();
                      save_config(&config);
+                     selected_index = i;
                  }
+                 // Optional: update selection on hover? Let's stick to click or key.
+             }
+
+             if is_highlighted && is_key_pressed(KeyCode::Enter) {
+                 config.selected_monitor = m.name.clone();
+                 save_config(&config);
              }
 
              draw_text(&text, 40.0, y, 20.0, color);
@@ -236,28 +274,65 @@ async fn run_setup() -> Option<AppMode> {
 
         y += 20.0;
 
+        // Pixelated Toggle
+        let pixelated_index = num_monitors;
+        let is_highlighted = pixelated_index == selected_index;
+        let color = if is_highlighted { RED } else { BLACK };
+        let check = if config.pixelated { "[x] " } else { "[ ] " };
+        let text = format!("{}Pixelated Look (Retro)", check);
+
+        let text_dims = measure_text(&text, None, 20, 1.0);
+        let rect = Rect::new(40.0, y - 15.0, text_dims.width, 25.0);
+
+        if rect.contains(vec2(mouse_position().0, mouse_position().1)) {
+             if is_mouse_button_pressed(MouseButton::Left) {
+                 config.pixelated = !config.pixelated;
+                 save_config(&config);
+                 selected_index = pixelated_index;
+             }
+        }
+        if is_highlighted && is_key_pressed(KeyCode::Enter) {
+             config.pixelated = !config.pixelated;
+             save_config(&config);
+        }
+
+        draw_text(&text, 40.0, y, 20.0, color);
+        y += 40.0;
+
         // Try it out Button
+        let try_index = num_monitors + 1;
+        let is_highlighted = try_index == selected_index;
+        let btn_color = if is_highlighted { DARKGRAY } else { GRAY };
+
         let try_rect = Rect::new(20.0, y, 150.0, 40.0);
-        draw_rectangle(try_rect.x, try_rect.y, try_rect.w, try_rect.h, GRAY);
+        draw_rectangle(try_rect.x, try_rect.y, try_rect.w, try_rect.h, btn_color);
         draw_text("Try it out", try_rect.x + 10.0, try_rect.y + 25.0, 20.0, WHITE);
 
-        if is_mouse_button_pressed(MouseButton::Left) {
-            let mpos = mouse_position();
-            if try_rect.contains(vec2(mpos.0, mpos.1)) {
+        if try_rect.contains(vec2(mouse_position().0, mouse_position().1)) {
+            if is_mouse_button_pressed(MouseButton::Left) {
                 return Some(AppMode::Clock { preview: true });
             }
+             // Update selection on hover for buttons is nice
+             // selected_index = try_index;
+        }
+        if is_highlighted && is_key_pressed(KeyCode::Enter) {
+             return Some(AppMode::Clock { preview: true });
         }
 
         y += 50.0;
 
         // Install Button
+        let install_index = num_monitors + 2;
+        let is_highlighted = install_index == selected_index;
+        let btn_color = if is_highlighted { BLUE } else { DARKBLUE }; // Lighter blue if highlighted
+
         let btn_rect = Rect::new(20.0, y, 200.0, 50.0);
-        draw_rectangle(btn_rect.x, btn_rect.y, btn_rect.w, btn_rect.h, DARKBLUE);
+        draw_rectangle(btn_rect.x, btn_rect.y, btn_rect.w, btn_rect.h, btn_color);
         draw_text("Install Screensaver", btn_rect.x + 10.0, btn_rect.y + 32.0, 20.0, WHITE);
 
-        if is_mouse_button_pressed(MouseButton::Left) {
-            let mpos = mouse_position();
-            if btn_rect.contains(vec2(mpos.0, mpos.1)) {
+        if btn_rect.contains(vec2(mouse_position().0, mouse_position().1)) {
+            if is_mouse_button_pressed(MouseButton::Left) {
+                // selected_index = install_index;
                 if let Ok(exe_path) = env::current_exe() {
                     let target = Path::new("C:\\Windows\\System32\\rust_flip_clock.scr");
                     match std::fs::copy(&exe_path, target) {
@@ -267,6 +342,17 @@ async fn run_setup() -> Option<AppMode> {
                 } else {
                     install_status = "Could not locate current executable.".to_string();
                 }
+            }
+        }
+        if is_highlighted && is_key_pressed(KeyCode::Enter) {
+            if let Ok(exe_path) = env::current_exe() {
+                let target = Path::new("C:\\Windows\\System32\\rust_flip_clock.scr");
+                match std::fs::copy(&exe_path, target) {
+                    Ok(_) => install_status = "Successfully installed to System32!".to_string(),
+                    Err(e) => install_status = format!("Error: {}. Try running as Admin.", e),
+                }
+            } else {
+                install_status = "Could not locate current executable.".to_string();
             }
         }
 
@@ -348,7 +434,9 @@ async fn run_clock(_preview: bool) -> bool {
     // Drawing at offset is easier.
 
     let mut flip_target = render_target(10, 10);
-    flip_target.texture.set_filter(FilterMode::Linear);
+    // Initialize filter based on config
+    let texture_filter = if config.pixelated { FilterMode::Nearest } else { FilterMode::Linear };
+    flip_target.texture.set_filter(texture_filter);
 
     let mut last_screen_size = (0.0, 0.0);
     let mouse_init_pos = mouse_position();
@@ -378,8 +466,15 @@ async fn run_clock(_preview: bool) -> bool {
 
         // Resize render target if needed
         if (sw - last_screen_size.0).abs() > 1.0 || (sh - last_screen_size.1).abs() > 1.0 {
-            flip_target = render_target(card_width as u32, card_height as u32);
-            flip_target.texture.set_filter(FilterMode::Linear);
+            let dpi = screen_dpi_scale();
+            let (target_w, target_h) = if config.pixelated {
+                 (card_width as u32, card_height as u32)
+            } else {
+                 ((card_width * dpi) as u32, (card_height * dpi) as u32)
+            };
+
+            flip_target = render_target(target_w, target_h);
+            flip_target.texture.set_filter(texture_filter);
             last_screen_size = (sw, sh);
         }
 
