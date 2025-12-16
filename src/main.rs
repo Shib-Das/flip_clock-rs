@@ -374,7 +374,10 @@ async fn run_setup(font: Option<&Font>) -> Option<AppMode> {
                          ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                              ui.add_space(20.0);
 
-                             if ui.button("Install Screensaver").clicked() {
+                             if ui.button("Install Screensaver")
+                                 .on_hover_text("Copies the screensaver to C:\\Windows\\System32 so it appears in Windows Screen Saver Settings.")
+                                 .clicked()
+                             {
                                  if let Ok(exe_path) = env::current_exe() {
                                      let target = Path::new("C:\\Windows\\System32\\rust_flip_clock.scr");
                                      match std::fs::copy(&exe_path, target) {
@@ -388,7 +391,10 @@ async fn run_setup(font: Option<&Font>) -> Option<AppMode> {
 
                              ui.add_space(10.0);
 
-                             if ui.button("Try it out").clicked() {
+                             if ui.button("Try it out")
+                                 .on_hover_text("Runs the screensaver in fullscreen. Move mouse or press any key to exit.")
+                                 .clicked()
+                             {
                                  next_mode = Some(AppMode::Clock { preview: true });
                              }
                          });
