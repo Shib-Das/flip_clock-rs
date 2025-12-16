@@ -2,9 +2,11 @@ use macroquad::prelude::*;
 use chrono::{Local, Timelike};
 use std::env;
 use std::path::Path;
+use egui_macroquad::egui;
+use macroquad::miniquad;
 
 mod config;
-use config::{load_config, save_config};
+use config::{load_config, save_config, AppConfig};
 
 #[cfg(windows)]
 mod windows_utils {
@@ -82,13 +84,9 @@ mod windows_utils {
 
     pub fn make_window_cover_virtual_screen() {
         unsafe {
-            // Find the window. Since we are the active process, GetForegroundWindow should work often,
-            // but let's be more robust if possible. Macroquad doesn't expose HWND.
-            // But usually the screensaver is the foreground window when running /s.
             let hwnd: HWND = GetForegroundWindow();
             if hwnd.is_null() { return; }
 
-            // Remove borders and make popup
             let style = GetWindowLongW(hwnd, GWL_STYLE);
             SetWindowLongW(hwnd, GWL_STYLE, ((style as u32 & !winapi::um::winuser::WS_OVERLAPPEDWINDOW) | WS_POPUP | WS_VISIBLE) as i32);
 
@@ -128,10 +126,55 @@ mod windows_utils {
     pub fn make_window_cover_virtual_screen() {}
 }
 
+#[derive(Clone, Copy, PartialEq)]
 struct TimeState {
     current_digits: [u32; 4],
+    current_seconds: [u32; 2],
     previous_digits: [u32; 4],
+    previous_seconds: [u32; 2],
     animation_start: Option<f64>,
+}
+
+impl TimeState {
+    fn new() -> Self {
+        let now = Local::now();
+        let hour = now.hour();
+        let minute = now.minute();
+        let second = now.second();
+        let digits = [hour / 10, hour % 10, minute / 10, minute % 10];
+        let seconds = [second / 10, second % 10];
+        Self {
+            current_digits: digits,
+            current_seconds: seconds,
+            previous_digits: digits,
+            previous_seconds: seconds,
+            animation_start: None,
+        }
+    }
+
+    fn update(&mut self, use_12h: bool) {
+        let now = Local::now();
+        let mut hour = now.hour();
+        if use_12h {
+            hour = hour % 12;
+            if hour == 0 { hour = 12; }
+        }
+        let minute = now.minute();
+        let second = now.second();
+
+        let new_digits = [hour / 10, hour % 10, minute / 10, minute % 10];
+        let new_seconds = [second / 10, second % 10];
+
+        if new_digits != self.current_digits || new_seconds != self.current_seconds {
+             if self.animation_start.is_none() {
+                 self.previous_digits = self.current_digits;
+                 self.previous_seconds = self.current_seconds;
+                 self.current_digits = new_digits;
+                 self.current_seconds = new_seconds;
+                 self.animation_start = Some(get_time());
+             }
+        }
+    }
 }
 
 #[derive(PartialEq)]
@@ -144,6 +187,8 @@ fn window_conf() -> Conf {
     Conf {
         window_title: "Flip Clock".to_owned(),
         high_dpi: true,
+        window_width: 1024,
+        window_height: 768,
         ..Default::default()
     }
 }
@@ -151,7 +196,7 @@ fn window_conf() -> Conf {
 #[macroquad::main(window_conf)]
 async fn main() {
     let args: Vec<String> = env::args().collect();
-    let mut mode = AppMode::Setup; // Default to setup if no args
+    let mut mode = AppMode::Setup;
 
     if args.len() > 1 {
         let arg = args[1].to_lowercase();
@@ -160,37 +205,28 @@ async fn main() {
         } else if arg.starts_with("/c") {
              mode = AppMode::Setup;
         } else if arg.starts_with("/p") {
-             // Preview mode usually implies drawing in a mini window handle passed as arg.
-             // But macroquad doesn't support that easily.
-             // We'll interpret it as Clock mode for now, but usually /p gives an HWND.
-             // Standard Windows preview sends: /p <HWND>
-             // For now, we will ignore the HWND and just exit or run normally.
-             // But if the user wants "Try it out", we handle that internally in Setup.
              mode = AppMode::Clock { preview: true };
         }
+    }
+
+    // Load font once
+    let font_path = "assets/fonts/Roboto-Bold.ttf";
+    let font = load_ttf_font(font_path).await.ok();
+    if font.is_none() {
+        eprintln!("Warning: Failed to load font");
     }
 
     loop {
         match mode {
             AppMode::Clock { preview } => {
-                if run_clock(preview).await {
-                    // if run_clock returns true, it means we want to return to setup (only from preview)
-                    // mode = AppMode::Setup;
-                    // Restore window size? Macroquad window might be stuck at full screen size.
-                    // This is tricky. Usually we just exit.
-                    // But for "Try it out", we might want to restart the loop.
-                    // However, we resized the window. We'd need to restore it.
-                    // For simplicity, "Try it out" will just run until exit for now.
-                    // Wait, if we return to setup, we need a standard window again.
-                    // Let's rely on restarting the app for simplicity if resizing back is hard.
-                    // But if `run_clock` returns, it means the user interrupted.
+                if run_clock(preview, font.as_ref()).await {
                     break;
                 } else {
                     break;
                 }
             },
             AppMode::Setup => {
-                if let Some(next_mode) = run_setup().await {
+                if let Some(next_mode) = run_setup(font.as_ref()).await {
                     mode = next_mode;
                 } else {
                     break;
@@ -200,245 +236,304 @@ async fn main() {
     }
 }
 
-async fn run_setup() -> Option<AppMode> {
+#[derive(PartialEq)]
+enum SetupTab {
+    General,
+    Layout,
+    Theme,
+}
+
+async fn run_setup(font: Option<&Font>) -> Option<AppMode> {
     let mut config = load_config();
     let monitors = windows_utils::get_monitors();
-    let mut install_status = String::new();
-    let mut selected_index = 0;
+    let mut active_tab = SetupTab::Layout;
 
-    // Items: Monitors... , Pixelated Toggle, Try It Out, Install
-    let num_monitors = monitors.len();
-    let total_items = num_monitors + 3;
+    let mut install_status = String::new();
+    let mut time_state = TimeState::new();
+
+    // Preview Render Target
+    let preview_width = 400;
+    let preview_height = 225; // 16:9 aspect roughly
+    let preview_target = render_target(preview_width as u32, preview_height as u32);
+    preview_target.texture.set_filter(FilterMode::Linear);
 
     loop {
-        clear_background(LIGHTGRAY);
+        // Update Time
+        time_state.update(config.use_12h_format);
 
-        // Keyboard navigation
-        if is_key_pressed(KeyCode::Up) {
-            if selected_index > 0 {
-                selected_index -= 1;
-            } else {
-                selected_index = total_items - 1;
+        // --- Render Preview Clock to Texture ---
+        {
+            let mut camera = Camera2D {
+                render_target: Some(preview_target.clone()),
+                ..Default::default()
+            };
+
+            // Map logical pixels to render target
+            camera.zoom = vec2(2.0 / preview_width as f32, 2.0 / preview_height as f32);
+            camera.target = vec2(preview_width as f32 / 2.0, preview_height as f32 / 2.0);
+
+            set_camera(&camera);
+
+            // Draw Background
+            let bg = mq_color_from_config(config.bg_color);
+            clear_background(bg);
+
+            // Draw Clock
+            let rect = Rect::new(0.0, 0.0, preview_width as f32, preview_height as f32);
+            draw_clock_face(&config, &mut time_state, rect, font, true);
+
+            // Pixelated Overlay (simulated)
+            if config.pixelated {
+                draw_rectangle(0.0, 0.0, preview_width as f32, preview_height as f32, Color::new(0.0, 0.0, 0.0, 0.2));
             }
-        }
-        if is_key_pressed(KeyCode::Down) {
-            if selected_index < total_items - 1 {
-                selected_index += 1;
-            } else {
-                selected_index = 0;
-            }
+
+            set_default_camera();
         }
 
-        let mut y = 20.0;
-        draw_text("Flip Clock Setup", 20.0, y + 20.0, 40.0, BLACK);
-        y += 60.0;
+        clear_background(BLACK);
 
-        draw_text("Select Display:", 20.0, y, 30.0, DARKGRAY);
-        y += 40.0;
+        let mut next_mode: Option<AppMode> = None;
+        let mut exit_setup = false;
 
-        // Monitors
-        for (i, m) in monitors.iter().enumerate() {
-             let is_configured = if config.selected_monitor.is_empty() {
-                 m.is_primary
-             } else {
-                 m.name == config.selected_monitor
-             };
+        egui_macroquad::ui(|ctx| {
+             // Dark Theme Setup
+             let mut visuals = egui::Visuals::dark();
+             visuals.panel_fill = egui::Color32::from_rgb(23, 23, 23); // #171717
+             ctx.set_visuals(visuals);
 
-             let is_highlighted = i == selected_index;
-             let color = if is_highlighted { RED } else { BLACK }; // Highlight color
-             let check = if is_configured { "[x] " } else { "[ ] " };
-             let primary_text = if m.is_primary { " (Primary)" } else { "" };
-             let text = format!("{}{}{}", check, m.name, primary_text);
+             // Styles
+             let mut style = (*ctx.style()).clone();
+             style.text_styles.insert(egui::TextStyle::Heading, egui::FontId::new(20.0, egui::FontFamily::Proportional));
+             style.text_styles.insert(egui::TextStyle::Body, egui::FontId::new(14.0, egui::FontFamily::Proportional));
+             ctx.set_style(style);
 
-             let text_dims = measure_text(&text, None, 20, 1.0);
-             let rect = Rect::new(40.0, y - 15.0, text_dims.width, 25.0);
+             // SIDEBAR
+             egui::SidePanel::left("sidebar")
+                 .default_width(250.0)
+                 .resizable(false)
+                 .show(ctx, |ui| {
+                     ui.add_space(20.0);
+                     ui.heading("Flip Clock");
+                     ui.label(egui::RichText::new("Configuration Utility v1.0").size(10.0).color(egui::Color32::from_gray(120)));
+                     ui.add_space(20.0);
 
-             // Mouse interaction
-             if rect.contains(vec2(mouse_position().0, mouse_position().1)) {
-                 if is_mouse_button_pressed(MouseButton::Left) {
-                     config.selected_monitor = m.name.clone();
-                     save_config(&config);
-                     selected_index = i;
-                 }
-                 // Optional: update selection on hover? Let's stick to click or key.
-             }
+                     // Navigation
+                     let nav_btn = |ui: &mut egui::Ui, text: &str, tab: SetupTab, current: &SetupTab| {
+                         let selected = *current == tab;
+                         let btn = ui.add_sized([ui.available_width(), 40.0], egui::SelectableLabel::new(selected, text));
+                         if btn.clicked() {
+                             return Some(tab);
+                         }
+                         None
+                     };
 
-             if is_highlighted && is_key_pressed(KeyCode::Enter) {
-                 config.selected_monitor = m.name.clone();
-                 save_config(&config);
-             }
+                     if let Some(t) = nav_btn(ui, "General", SetupTab::General, &active_tab) { active_tab = t; }
+                     if let Some(t) = nav_btn(ui, "Layout & Size", SetupTab::Layout, &active_tab) { active_tab = t; }
+                     if let Some(t) = nav_btn(ui, "Theme & Color", SetupTab::Theme, &active_tab) { active_tab = t; }
 
-             draw_text(&text, 40.0, y, 20.0, color);
-             y += 30.0;
-        }
+                     ui.add_space(40.0);
 
-        y += 20.0;
+                     // PREVIEW
+                     ui.label("PREVIEW");
 
-        // Pixelated Toggle
-        let pixelated_index = num_monitors;
-        let is_highlighted = pixelated_index == selected_index;
-        let color = if is_highlighted { RED } else { BLACK };
-        let check = if config.pixelated { "[x] " } else { "[ ] " };
-        let text = format!("{}Pixelated Look (Retro)", check);
+                     // Retrieve raw OpenGL Texture ID from Miniquad
+                     let gl = unsafe { get_internal_gl() };
+                     let mq_tex = preview_target.texture.raw_miniquad_id();
+                     let raw_id = match unsafe { gl.quad_context.texture_raw_id(mq_tex) } {
+                         miniquad::RawId::OpenGl(id) => id as u64,
+                         _ => 0, // Should not happen on OpenGL platforms
+                     };
 
-        let text_dims = measure_text(&text, None, 20, 1.0);
-        let rect = Rect::new(40.0, y - 15.0, text_dims.width, 25.0);
+                     if raw_id != 0 {
+                         let texture_id = egui::TextureId::User(raw_id);
+                         ui.image(egui::load::SizedTexture::new(texture_id, [240.0, 135.0]));
+                     } else {
+                         ui.label("Preview unavailable (Render Backend not supported)");
+                     }
 
-        if rect.contains(vec2(mouse_position().0, mouse_position().1)) {
-             if is_mouse_button_pressed(MouseButton::Left) {
-                 config.pixelated = !config.pixelated;
-                 save_config(&config);
-                 selected_index = pixelated_index;
-             }
-        }
-        if is_highlighted && is_key_pressed(KeyCode::Enter) {
-             config.pixelated = !config.pixelated;
-             save_config(&config);
-        }
+                     ui.label(egui::RichText::new("Updates live").size(10.0).color(egui::Color32::from_gray(100)));
 
-        draw_text(&text, 40.0, y, 20.0, color);
-        y += 40.0;
+                     ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                         ui.add_space(10.0);
+                         ui.label("Press ESC to exit");
+                     });
+                 });
 
-        // Try it out Button
-        let try_index = num_monitors + 1;
-        let is_highlighted = try_index == selected_index;
-        let btn_color = if is_highlighted { DARKGRAY } else { GRAY };
+             // BOTTOM BAR (Action Bar)
+             egui::TopBottomPanel::bottom("bottom_bar")
+                 .min_height(60.0)
+                 .show(ctx, |ui| {
+                     ui.horizontal(|ui| {
+                         ui.add_space(20.0);
+                         if !install_status.is_empty() {
+                             ui.label(egui::RichText::new(&install_status).color(egui::Color32::GREEN));
+                         } else {
+                             ui.label("Ready to install");
+                         }
 
-        let try_rect = Rect::new(20.0, y, 150.0, 40.0);
-        draw_rectangle(try_rect.x, try_rect.y, try_rect.w, try_rect.h, btn_color);
-        draw_text("Try it out", try_rect.x + 10.0, try_rect.y + 25.0, 20.0, WHITE);
+                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                             ui.add_space(20.0);
 
-        if try_rect.contains(vec2(mouse_position().0, mouse_position().1)) {
-            if is_mouse_button_pressed(MouseButton::Left) {
-                return Some(AppMode::Clock { preview: true });
-            }
-             // Update selection on hover for buttons is nice
-             // selected_index = try_index;
-        }
-        if is_highlighted && is_key_pressed(KeyCode::Enter) {
-             return Some(AppMode::Clock { preview: true });
-        }
+                             if ui.button("Install Screensaver").clicked() {
+                                 if let Ok(exe_path) = env::current_exe() {
+                                     let target = Path::new("C:\\Windows\\System32\\rust_flip_clock.scr");
+                                     match std::fs::copy(&exe_path, target) {
+                                         Ok(_) => install_status = "Successfully installed to System32!".to_string(),
+                                         Err(e) => install_status = format!("Error: {}", e),
+                                     }
+                                 } else {
+                                     install_status = "Could not locate current executable.".to_string();
+                                 }
+                             }
 
-        y += 50.0;
+                             ui.add_space(10.0);
 
-        // Install Button
-        let install_index = num_monitors + 2;
-        let is_highlighted = install_index == selected_index;
-        let btn_color = if is_highlighted { BLUE } else { DARKBLUE }; // Lighter blue if highlighted
+                             if ui.button("Try it out").clicked() {
+                                 next_mode = Some(AppMode::Clock { preview: true });
+                             }
+                         });
+                     });
+                 });
 
-        let btn_rect = Rect::new(20.0, y, 200.0, 50.0);
-        draw_rectangle(btn_rect.x, btn_rect.y, btn_rect.w, btn_rect.h, btn_color);
-        draw_text("Install Screensaver", btn_rect.x + 10.0, btn_rect.y + 32.0, 20.0, WHITE);
+             // MAIN CONTENT
+             egui::CentralPanel::default().show(ctx, |ui| {
+                 egui::ScrollArea::vertical().show(ui, |ui| {
+                     ui.add_space(20.0);
+                     match active_tab {
+                         SetupTab::General => {
+                             ui.heading("Display Selection");
+                             ui.label("Choose which monitor plays the screensaver");
+                             ui.add_space(10.0);
 
-        if btn_rect.contains(vec2(mouse_position().0, mouse_position().1)) {
-            if is_mouse_button_pressed(MouseButton::Left) {
-                // selected_index = install_index;
-                if let Ok(exe_path) = env::current_exe() {
-                    let target = Path::new("C:\\Windows\\System32\\rust_flip_clock.scr");
-                    match std::fs::copy(&exe_path, target) {
-                        Ok(_) => install_status = "Successfully installed to System32!".to_string(),
-                        Err(e) => install_status = format!("Error: {}. Try running as Admin.", e),
-                    }
-                } else {
-                    install_status = "Could not locate current executable.".to_string();
-                }
-            }
-        }
-        if is_highlighted && is_key_pressed(KeyCode::Enter) {
-            if let Ok(exe_path) = env::current_exe() {
-                let target = Path::new("C:\\Windows\\System32\\rust_flip_clock.scr");
-                match std::fs::copy(&exe_path, target) {
-                    Ok(_) => install_status = "Successfully installed to System32!".to_string(),
-                    Err(e) => install_status = format!("Error: {}. Try running as Admin.", e),
-                }
-            } else {
-                install_status = "Could not locate current executable.".to_string();
-            }
-        }
+                             for m in &monitors {
+                                 let is_selected = if config.selected_monitor.is_empty() { m.is_primary } else { m.name == config.selected_monitor };
+                                 let primary_txt = if m.is_primary { " • Primary" } else { "" };
+                                 let label = format!("{} ({}x{}){}", m.name, m.width, m.height, primary_txt);
 
-        if !install_status.is_empty() {
-             draw_text(&install_status, 230.0, y + 32.0, 20.0, RED);
-        }
+                                 if ui.selectable_label(is_selected, label).clicked() {
+                                     config.selected_monitor = m.name.clone();
+                                     save_config(&config);
+                                 }
+                             }
 
-        y += 70.0;
-        draw_text("Press ESC to exit", 20.0, y, 20.0, DARKGRAY);
+                             ui.add_space(20.0);
+                             ui.separator();
+                             ui.add_space(20.0);
+
+                             ui.heading("Clock Behavior");
+                             if ui.checkbox(&mut config.use_12h_format, "12-Hour Format").changed() { save_config(&config); }
+                             if ui.checkbox(&mut config.show_seconds, "Show Seconds").changed() { save_config(&config); }
+                         },
+                         SetupTab::Layout => {
+                             ui.heading("Dimensions");
+                             ui.add_space(10.0);
+
+                             ui.label("Overall Scale (%)");
+                             // Scale 20% to 100%
+                             let mut scale_pct = config.scale * 100.0;
+                             if ui.add(egui::Slider::new(&mut scale_pct, 20.0..=100.0)).changed() {
+                                 config.scale = scale_pct / 100.0;
+                                 save_config(&config);
+                             }
+
+                             ui.label("Card Spacing (%)");
+                             let mut spacing_pct = config.spacing * 100.0;
+                             if ui.add(egui::Slider::new(&mut spacing_pct, 0.0..=10.0)).changed() {
+                                 config.spacing = spacing_pct / 100.0;
+                                 save_config(&config);
+                             }
+
+                             ui.label("Corner Radius (px)");
+                             if ui.add(egui::Slider::new(&mut config.corner_radius, 0.0..=20.0)).changed() {
+                                 save_config(&config);
+                             }
+
+                             ui.add_space(20.0);
+                             ui.heading("Rendering Style");
+                             if ui.checkbox(&mut config.pixelated, "Retro Pixelated Mode").changed() {
+                                 save_config(&config);
+                             }
+                         },
+                         SetupTab::Theme => {
+                             ui.heading("Colors");
+                             ui.add_space(10.0);
+
+                             fn color_edit(ui: &mut egui::Ui, label: &str, color: &mut [f32; 3]) -> bool {
+                                 let mut rgb = [color[0], color[1], color[2]];
+                                 let changed = ui.color_edit_button_rgb(&mut rgb).changed();
+                                 if changed {
+                                     *color = rgb;
+                                 }
+                                 ui.label(label);
+                                 changed
+                             }
+
+                             ui.horizontal(|ui| {
+                                 if color_edit(ui, "Background", &mut config.bg_color) { save_config(&config); }
+                             });
+                             ui.horizontal(|ui| {
+                                 if color_edit(ui, "Card Background", &mut config.card_color) { save_config(&config); }
+                             });
+                             ui.horizontal(|ui| {
+                                 if color_edit(ui, "Text / Digits", &mut config.text_color) { save_config(&config); }
+                             });
+
+                             ui.add_space(20.0);
+                             ui.heading("Animation");
+                             ui.label("Flip Duration (ms)");
+                             if ui.add(egui::Slider::new(&mut config.animation_speed, 100..=2000)).changed() {
+                                 save_config(&config);
+                             }
+                         }
+                     }
+                 });
+             });
+        });
+
+        egui_macroquad::draw();
 
         if is_key_pressed(KeyCode::Escape) {
+            exit_setup = true;
+        }
+
+        if exit_setup {
             return None;
+        }
+        if let Some(nm) = next_mode {
+            return Some(nm);
         }
 
         next_frame().await;
     }
 }
 
-// Returns true if should return to setup (not implemented currently), false if exit
-async fn run_clock(_preview: bool) -> bool {
+async fn run_clock(_preview: bool, font: Option<&Font>) -> bool {
     show_mouse(false);
 
-    // Apply configuration to window
     #[cfg(windows)]
-    {
-        // Give a small delay to ensure window is created by macroquad?
-        // Macroquad creates window before main.
-        windows_utils::make_window_cover_virtual_screen();
-    }
+    { windows_utils::make_window_cover_virtual_screen(); }
     #[cfg(not(windows))]
-    {
-        windows_utils::make_window_cover_virtual_screen();
-    }
+    { windows_utils::make_window_cover_virtual_screen(); }
 
-    // Get Monitor info to decide where to draw
     let config = load_config();
     let monitors = windows_utils::get_monitors();
     let virtual_rect = windows_utils::get_virtual_screen_rect();
 
-    // Determine the target rectangle for the clock (relative to the virtual screen top-left)
     let target_monitor = if config.selected_monitor.is_empty() {
         monitors.iter().find(|m| m.is_primary).or(monitors.first())
     } else {
         monitors.iter().find(|m| m.name == config.selected_monitor).or(monitors.first())
     };
 
-    let (clock_x, clock_y, clock_w, clock_h) = if let Some(m) = target_monitor {
-        // Map monitor coordinates to window coordinates
-        // Window is at virtual_rect.x, virtual_rect.y
+    let clock_rect = if let Some(m) = target_monitor {
         let rel_x = (m.x as f32) - virtual_rect.x;
         let rel_y = (m.y as f32) - virtual_rect.y;
-        (rel_x, rel_y, m.width as f32, m.height as f32)
+        Rect::new(rel_x, rel_y, m.width as f32, m.height as f32)
     } else {
-        (0.0, 0.0, screen_width(), screen_height())
+        Rect::new(0.0, 0.0, screen_width(), screen_height())
     };
 
-    let font_path = "assets/fonts/Roboto-Bold.ttf";
-    let font = load_ttf_font(font_path).await;
-    let font = match font {
-        Ok(f) => Some(f),
-        Err(e) => {
-            eprintln!("Warning: Failed to load font: {}", e);
-            None
-        }
-    };
-
-    let now = Local::now();
-    let hour = now.hour();
-    let minute = now.minute();
-    let initial_digits = [hour / 10, hour % 10, minute / 10, minute % 10];
-
-    let mut time_state = TimeState {
-        current_digits: initial_digits,
-        previous_digits: initial_digits,
-        animation_start: None,
-    };
-
-    // We need to render the clock into a texture? Or just draw it at the correct offset.
-    // Drawing at offset is easier.
-
-    let mut flip_target = render_target(10, 10);
-    // Initialize filter based on config
-    let texture_filter = if config.pixelated { FilterMode::Nearest } else { FilterMode::Linear };
-    flip_target.texture.set_filter(texture_filter);
-
-    let mut last_screen_size = (0.0, 0.0);
+    let mut time_state = TimeState::new();
     let mouse_init_pos = mouse_position();
     let last_mouse_check = get_time();
 
@@ -446,158 +541,164 @@ async fn run_clock(_preview: bool) -> bool {
         if get_last_key_pressed().is_some() {
             return false;
         }
-
         if get_time() - last_mouse_check > 0.5 {
             let current_pos = mouse_position();
-            // In preview mode or normal mode, large mouse movement exits
             if (current_pos.0 - mouse_init_pos.0).abs() > 10.0 || (current_pos.1 - mouse_init_pos.1).abs() > 10.0 {
                 return false;
             }
         }
 
-        // Draw black everywhere
-        clear_background(BLACK);
+        time_state.update(config.use_12h_format);
 
-        let sw = clock_w;
-        let sh = clock_h;
+        // Draw background
+        let bg_color = mq_color_from_config(config.bg_color);
+        clear_background(bg_color);
 
-        let card_height = sh * 0.4;
-        let card_width = sw * 0.15;
+        draw_clock_face(&config, &mut time_state, clock_rect, font, false);
 
-        // Resize render target if needed
-        if (sw - last_screen_size.0).abs() > 1.0 || (sh - last_screen_size.1).abs() > 1.0 {
-            let dpi = screen_dpi_scale();
-            let (target_w, target_h) = if config.pixelated {
-                 (card_width as u32, card_height as u32)
-            } else {
-                 ((card_width * dpi) as u32, (card_height * dpi) as u32)
-            };
-
-            flip_target = render_target(target_w, target_h);
-            flip_target.texture.set_filter(texture_filter);
-            last_screen_size = (sw, sh);
-        }
-
-        let spacing = sw * 0.02;
-        let group_gap = spacing * 3.0;
-        let total_width = 4.0 * card_width + 2.0 * spacing + group_gap;
-
-        // Calculate start position relative to the clock monitor's area
-        let start_x = clock_x + (sw - total_width) / 2.0;
-        let start_y = clock_y + (sh - card_height) / 2.0;
-
-        let font_size = (card_height * 0.8) as u16;
-
-        let now = Local::now();
-        let hour = now.hour();
-        let minute = now.minute();
-        let new_digits = [hour / 10, hour % 10, minute / 10, minute % 10];
-
-        if new_digits != time_state.current_digits {
-            time_state.previous_digits = time_state.current_digits;
-            time_state.current_digits = new_digits;
-            time_state.animation_start = Some(get_time());
-        }
-
-        let mut progress = 0.0;
-        if let Some(start) = time_state.animation_start {
-            let elapsed = get_time() - start;
-            let duration = 0.6;
-            progress = (elapsed / duration) as f32;
-            if progress >= 1.0 {
-                progress = 1.0;
-                time_state.animation_start = None;
-                time_state.previous_digits = time_state.current_digits;
-            }
-        }
-
-        let mut x_offset = start_x;
-
-        for (i, &digit) in time_state.current_digits.iter().enumerate() {
-            let prev_digit = time_state.previous_digits[i];
-            let digit_progress = if digit == prev_digit { 1.0 } else { progress };
-
-            draw_flip_card(
-                x_offset,
-                start_y,
-                card_width,
-                card_height,
-                digit,
-                prev_digit,
-                digit_progress,
-                font.as_ref(),
-                font_size,
-                &flip_target,
-            );
-
-            x_offset += card_width + spacing;
-            if i == 1 {
-                x_offset += group_gap - spacing;
-            }
-        }
-
-        next_frame().await
+        next_frame().await;
     }
 }
 
-// Reuse the draw helper functions
-fn draw_flip_card(
-    x: f32,
-    y: f32,
-    w: f32,
-    h: f32,
-    digit: u32,
-    prev_digit: u32,
+// -- Helpers --
+
+fn mq_color_from_config(c: [f32; 3]) -> Color {
+    Color::new(c[0], c[1], c[2], 1.0)
+}
+
+fn draw_clock_face(
+    config: &AppConfig,
+    time_state: &mut TimeState,
+    rect: Rect, // Draw area
+    font: Option<&Font>,
+    is_preview: bool
+) {
+    let sw = rect.w;
+    let sh = rect.h;
+
+    let base_card_height = sh * 0.4;
+    let card_height = base_card_height * config.scale;
+    let card_width = card_height * 0.6; // Aspect ratio
+
+    let spacing = card_width * config.spacing; // spacing is relative to card width
+    let group_gap = spacing * 3.0;
+
+    // Digits: [H H] : [M M] (: [S S])
+    let mut total_cards = 4;
+    let mut total_groups_gaps = 1;
+    let mut total_spacing = 2; // gaps between HH and MM
+
+    if config.show_seconds {
+        total_cards += 2;
+        total_groups_gaps += 1;
+        total_spacing += 1;
+    }
+
+    let total_width = (total_cards as f32 * card_width) + (total_spacing as f32 * spacing) + (total_groups_gaps as f32 * group_gap);
+
+    let start_x = rect.x + (sw - total_width) / 2.0;
+    let start_y = rect.y + (sh - card_height) / 2.0;
+
+    let font_size = (card_height * 0.8) as u16;
+    let corner_radius = config.corner_radius * (if is_preview { 0.5 } else { 1.0 }); // Scale down radius for preview slightly
+
+    // Animation progress
+    let mut progress = 0.0;
+    if let Some(start) = time_state.animation_start {
+        let elapsed = (get_time() - start) * 1000.0;
+        let duration = config.animation_speed as f64;
+        progress = (elapsed / duration) as f32;
+        if progress >= 1.0 {
+            progress = 1.0;
+            // Finish animation
+            time_state.animation_start = None;
+            time_state.previous_digits = time_state.current_digits;
+            time_state.previous_seconds = time_state.current_seconds;
+        }
+    }
+
+    let mut x = start_x;
+
+    let card_color = mq_color_from_config(config.card_color);
+    let text_color = mq_color_from_config(config.text_color);
+
+    // Draw Digits
+    for (i, &digit) in time_state.current_digits.iter().enumerate() {
+        let prev_digit = time_state.previous_digits[i];
+        let p = if digit == prev_digit { 1.0 } else { progress };
+
+        draw_single_flip_card(x, start_y, card_width, card_height, digit, prev_digit, p, font, font_size, card_color, text_color, corner_radius);
+
+        x += card_width + spacing;
+        if i == 1 {
+            // Draw Separator
+            draw_separator(x + (group_gap - spacing) / 2.0, start_y, card_height, text_color);
+            x += group_gap;
+        }
+    }
+
+    if config.show_seconds {
+        draw_separator(x - group_gap + (group_gap - spacing) / 2.0, start_y, card_height, text_color);
+
+        for (i, &digit) in time_state.current_seconds.iter().enumerate() {
+            let prev_digit = time_state.previous_seconds[i];
+            let p = if digit == prev_digit { 1.0 } else { progress };
+
+            draw_single_flip_card(x, start_y, card_width, card_height, digit, prev_digit, p, font, font_size, card_color, text_color, corner_radius);
+
+            x += card_width + spacing;
+        }
+    }
+}
+
+fn draw_separator(cx: f32, y: f32, h: f32, color: Color) {
+    let dot_size = h * 0.05;
+    let gap = h * 0.15;
+    let cy = y + h / 2.0;
+    draw_circle(cx, cy - gap, dot_size, color);
+    draw_circle(cx, cy + gap, dot_size, color);
+}
+
+fn draw_single_flip_card(
+    x: f32, y: f32, w: f32, h: f32,
+    digit: u32, prev_digit: u32,
     progress: f32,
     font: Option<&Font>,
     font_size: u16,
-    flip_target: &RenderTarget,
+    bg_color: Color,
+    text_color: Color,
+    radius: f32,
 ) {
-    let bg_color = Color::new(0.16, 0.16, 0.16, 1.0);
-
-    if progress >= 1.0 {
-        draw_card_bg(x, y, w, h, bg_color);
-        draw_digit_centered(x, y, w, h, digit, font, font_size);
+    // Draw Background
+    if radius > 0.0 {
+        draw_rounded_rectangle(x, y, w, h, radius, bg_color);
     } else {
-        draw_card_bg(x, y, w, h, bg_color);
-        draw_digit_centered(x, y, w, h, prev_digit, font, font_size);
-
-        let mut camera = Camera2D {
-            render_target: Some(flip_target.clone()),
-            ..Default::default()
-        };
-        camera.zoom = vec2(2.0 / w, -2.0 / h);
-        camera.target = vec2(w / 2.0, h / 2.0);
-
-        set_camera(&camera);
-        clear_background(Color::new(0.0, 0.0, 0.0, 0.0));
-        draw_card_bg(0.0, 0.0, w, h, bg_color);
-        draw_digit_centered(0.0, 0.0, w, h, digit, font, font_size);
-        set_default_camera();
-
-        let wipe_height = h * progress;
-        draw_texture_ex(
-            &flip_target.texture,
-            x,
-            y,
-            WHITE,
-            DrawTextureParams {
-                dest_size: Some(vec2(w, wipe_height)),
-                source: Some(Rect::new(0.0, 0.0, w, wipe_height)),
-                ..Default::default()
-            },
-        );
+        draw_rectangle(x, y, w, h, bg_color);
     }
 
+    let display_digit = if progress > 0.5 { digit } else { prev_digit };
+    draw_digit_centered(x, y, w, h, display_digit, font, font_size, text_color);
+
+    // Split line
     let mid_y = y + h / 2.0;
-    draw_line(x, mid_y, x + w, mid_y, 4.0, BLACK);
+    draw_line(x, mid_y, x + w, mid_y, 2.0, Color::new(0.0, 0.0, 0.0, 0.5));
+
+    if progress < 1.0 {
+        let flip_y = y + (h * progress);
+        draw_line(x, flip_y, x + w, flip_y, 2.0, Color::new(0.0, 0.0, 0.0, 0.3));
+    }
 }
 
-fn draw_card_bg(x: f32, y: f32, w: f32, h: f32, color: Color) {
-    draw_rectangle(x, y, w, h, color);
+fn draw_rounded_rectangle(x: f32, y: f32, w: f32, h: f32, r: f32, color: Color) {
+    draw_rectangle(x + r, y, w - 2.0 * r, h, color);
+    draw_rectangle(x, y + r, w, h - 2.0 * r, color);
+    draw_circle(x + r, y + r, r, color);
+    draw_circle(x + w - r, y + r, r, color);
+    draw_circle(x + r, y + h - r, r, color);
+    draw_circle(x + w - r, y + h - r, r, color);
 }
 
-fn draw_digit_centered(x: f32, y: f32, w: f32, h: f32, digit: u32, font: Option<&Font>, font_size: u16) {
+fn draw_digit_centered(x: f32, y: f32, w: f32, h: f32, digit: u32, font: Option<&Font>, font_size: u16, color: Color) {
     let text = digit.to_string();
     let dims = measure_text(&text, font, font_size, 1.0);
     let tx = x + (w - dims.width) / 2.0;
@@ -606,7 +707,7 @@ fn draw_digit_centered(x: f32, y: f32, w: f32, h: f32, digit: u32, font: Option<
     draw_text_ex(&text, tx, ty, TextParams {
         font,
         font_size,
-        color: WHITE,
+        color,
         ..Default::default()
     });
 }
