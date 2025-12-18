@@ -433,13 +433,58 @@ async fn run_setup(font: Option<&Font>) -> Option<AppMode> {
         // or we could show the Departure Board if that's selected for a monitor.
         // Let's just show the standard Clock Face in the sidebar preview for now.
         {
-             let mut camera = Camera2D {
-                render_target: Some(preview_target.clone()),
-                ..Default::default()
-            };
-            // Map logical pixels to render target
-            camera.zoom = vec2(2.0 / preview_width as f32, 2.0 / preview_height as f32);
-            camera.target = vec2(preview_width as f32 / 2.0, preview_height as f32 / 2.0);
+            if config.pixelated {
+                // 1. Render to tiny target
+                 let mut camera = Camera2D {
+                    render_target: Some(pixel_target.clone()),
+                    ..Default::default()
+                };
+                camera.zoom = vec2(2.0 / pixel_w as f32, 2.0 / pixel_h as f32);
+                camera.target = vec2(pixel_w as f32 / 2.0, pixel_h as f32 / 2.0);
+                set_camera(&camera);
+
+                let bg = mq_color_from_config(config.bg_color);
+                clear_background(bg);
+                let rect = Rect::new(0.0, 0.0, pixel_w as f32, pixel_h as f32);
+                draw_clock_face(&config, &mut time_state, rect, font, true);
+
+                set_default_camera();
+
+                // 2. Render tiny target to preview target
+                let mut camera_preview = Camera2D {
+                    render_target: Some(preview_target.clone()),
+                    ..Default::default()
+                };
+                camera_preview.zoom = vec2(2.0 / preview_width as f32, 2.0 / preview_height as f32);
+                camera_preview.target = vec2(preview_width as f32 / 2.0, preview_height as f32 / 2.0);
+                set_camera(&camera_preview);
+                
+                clear_background(bg); // Clear with bg color
+                
+                draw_texture_ex(
+                    &pixel_target.texture,
+                    0.0,
+                    0.0,
+                    WHITE,
+                    DrawTextureParams {
+                        dest_size: Some(vec2(preview_width as f32, preview_height as f32)),
+                        flip_y: true,
+                        ..Default::default()
+                    }
+                );
+
+                set_default_camera();
+
+            } else {
+                // Normal High-Res Preview
+                let mut camera = Camera2D {
+                    render_target: Some(preview_target.clone()),
+                    ..Default::default()
+                };
+
+                // Map logical pixels to render target
+                camera.zoom = vec2(2.0 / preview_width as f32, 2.0 / preview_height as f32);
+                camera.target = vec2(preview_width as f32 / 2.0, preview_height as f32 / 2.0);
 
             set_camera(&camera);
 
@@ -447,10 +492,9 @@ async fn run_setup(font: Option<&Font>) -> Option<AppMode> {
             let bg = mq_color_from_config(config.bg_color);
             clear_background(bg);
 
-            // Draw Clock
-            let rect = Rect::new(0.0, 0.0, preview_width as f32, preview_height as f32);
-            // Just draw standard clock face
-            draw_clock_face(&config, &mut clock_state, rect, font, true);
+                // Draw Clock
+                let rect = Rect::new(0.0, 0.0, preview_width as f32, preview_height as f32);
+                draw_clock_face(&config, &mut time_state, rect, font, true);
 
             set_default_camera();
         }
@@ -757,27 +801,37 @@ async fn run_clock(_preview: bool, font: Option<&Font>) -> bool {
         let bg_color = mq_color_from_config(config.bg_color);
         clear_background(bg_color);
 
-        // Draw for each monitor
-        for m in &monitors {
-            let rel_x = (m.x as f32) - virtual_rect.x;
-            let rel_y = (m.y as f32) - virtual_rect.y;
-            let rect = Rect::new(rel_x, rel_y, m.width as f32, m.height as f32);
+        if config.pixelated {
+             let mut camera = Camera2D {
+                render_target: Some(render_target.clone()),
+                ..Default::default()
+            };
+            camera.zoom = vec2(2.0 / pixel_width as f32, 2.0 / pixel_height as f32);
+            camera.target = vec2(pixel_width as f32 / 2.0, pixel_height as f32 / 2.0);
 
-            let view_type = config.monitor_views.get(&m.name).unwrap_or(&ViewType::Off);
+            set_camera(&camera);
+            clear_background(bg_color);
+            
+            // Draw clock into small texture
+            let small_rect = Rect::new(0.0, 0.0, pixel_width as f32, pixel_height as f32);
+            draw_clock_face(&config, &mut time_state, small_rect, font, false);
+            
+            set_default_camera();
 
-            match view_type {
-                ViewType::Clock => {
-                    // TODO: Pixelated mode support needs per-monitor target or viewport tricks.
-                    // For now, render standard.
-                    draw_clock_face(&config, &mut clock_state, rect, font, false);
-                },
-                ViewType::DepartureBoard => {
-                    draw_departure_board(&config, &mut departure_state, rect, font);
-                },
-                ViewType::Off => {
-                    // Do nothing (black background remains)
+            // Draw texture to screen scaled up
+            draw_texture_ex(
+                &render_target.texture,
+                clock_rect.x,
+                clock_rect.y,
+                WHITE,
+                DrawTextureParams {
+                    dest_size: Some(vec2(clock_rect.w, clock_rect.h)),
+                    flip_y: true, // Render targets are flipped
+                    ..Default::default()
                 }
-            }
+            );
+        } else {
+            draw_clock_face(&config, &mut time_state, clock_rect, font, false);
         }
 
         next_frame().await;
@@ -795,7 +849,8 @@ fn draw_clock_face(
     state: &mut ClockState,
     rect: Rect, // Draw area
     font: Option<&Font>,
-    is_preview: bool
+    is_preview: bool,
+    flip_content: bool,
 ) {
     let sw = rect.w;
     let sh = rect.h;
@@ -850,7 +905,7 @@ fn draw_clock_face(
         let prev_digit = &state.previous_digits[i];
         let p = if digit == prev_digit { 1.0 } else { progress };
 
-        draw_single_flip_card(x, start_y, card_width, card_height, digit, prev_digit, p, font, font_size, card_color, text_color, corner_radius);
+        draw_single_flip_card(x, start_y, card_width, card_height, digit, prev_digit, p, font, font_size, card_color, text_color, corner_radius, flip_content);
 
         x += card_width + spacing;
         if i == 1 {
@@ -867,7 +922,7 @@ fn draw_clock_face(
             let prev_digit = &state.previous_seconds[i];
             let p = if digit == prev_digit { 1.0 } else { progress };
 
-            draw_single_flip_card(x, start_y, card_width, card_height, digit, prev_digit, p, font, font_size, card_color, text_color, corner_radius);
+            draw_single_flip_card(x, start_y, card_width, card_height, digit, prev_digit, p, font, font_size, card_color, text_color, corner_radius, flip_content);
 
             x += card_width + spacing;
         }
@@ -1002,6 +1057,7 @@ fn draw_single_flip_card(
     bg_color: Color,
     text_color: Color,
     radius: f32,
+    flip_content: bool,
 ) {
     // Draw Background
     if radius > 0.0 {
@@ -1010,8 +1066,8 @@ fn draw_single_flip_card(
         draw_rectangle(x, y, w, h, bg_color);
     }
 
-    let display_content = if progress > 0.5 { content } else { prev_content };
-    draw_text_centered(x, y, w, h, display_content, font, font_size, text_color);
+    let display_digit = if progress > 0.5 { digit } else { prev_digit };
+    draw_digit_centered(x, y, w, h, display_digit, font, font_size, text_color);
 
     // Split line
     let mid_y = y + h / 2.0;
@@ -1035,8 +1091,9 @@ fn draw_rounded_rectangle(x: f32, y: f32, w: f32, h: f32, r: f32, color: Color) 
     draw_circle(x + w - r, y + h - r, r, color);
 }
 
-fn draw_text_centered(x: f32, y: f32, w: f32, h: f32, text: &str, font: Option<&Font>, font_size: u16, color: Color) {
-    let dims = measure_text(text, font, font_size, 1.0);
+fn draw_digit_centered(x: f32, y: f32, w: f32, h: f32, digit: u32, font: Option<&Font>, font_size: u16, color: Color) {
+    let text = digit.to_string();
+    let dims = measure_text(&text, font, font_size, 1.0);
     let tx = x + (w - dims.width) / 2.0;
     let ty = y + (h - dims.height) / 2.0 + dims.offset_y;
 
@@ -1044,6 +1101,7 @@ fn draw_text_centered(x: f32, y: f32, w: f32, h: f32, text: &str, font: Option<&
         font,
         font_size,
         color,
+        font_scale_aspect: if flip_x { -1.0 } else { 1.0 },
         ..Default::default()
     });
 }
