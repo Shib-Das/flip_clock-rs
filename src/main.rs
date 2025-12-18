@@ -102,6 +102,27 @@ mod windows_utils {
             );
         }
     }
+
+    pub fn restore_window() {
+        unsafe {
+            let hwnd: HWND = GetForegroundWindow();
+            if hwnd.is_null() { return; }
+
+            // Restore style
+            let style = winapi::um::winuser::WS_OVERLAPPEDWINDOW | WS_VISIBLE;
+            SetWindowLongW(hwnd, GWL_STYLE, style as i32);
+
+            // Restore position and size to default 1024x768
+            // We can center it or just put it at 50,50
+            SetWindowPos(
+                hwnd,
+                HWND_TOP,
+                50, 50,
+                1024, 768,
+                SWP_SHOWWINDOW
+            );
+        }
+    }
 }
 
 #[cfg(not(windows))]
@@ -124,6 +145,7 @@ mod windows_utils {
         Rect::new(0.0, 0.0, 1920.0, 1080.0)
     }
     pub fn make_window_cover_virtual_screen() {}
+    pub fn restore_window() {}
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -219,8 +241,9 @@ async fn main() {
     loop {
         match mode {
             AppMode::Clock { preview } => {
-                if run_clock(preview, font.as_ref()).await {
-                    break;
+                run_clock(preview, font.as_ref()).await;
+                if preview {
+                    mode = AppMode::Setup;
                 } else {
                     break;
                 }
@@ -540,16 +563,31 @@ async fn run_clock(_preview: bool, font: Option<&Font>) -> bool {
     };
 
     let mut time_state = TimeState::new();
-    let mouse_init_pos = mouse_position();
-    let last_mouse_check = get_time();
+    let mut mouse_init_pos = mouse_position();
+    let start_time = get_time();
 
     loop {
         if get_last_key_pressed().is_some() {
+            #[cfg(windows)]
+            { windows_utils::restore_window(); }
+            #[cfg(not(windows))]
+            { windows_utils::restore_window(); }
+            show_mouse(true);
             return false;
         }
-        if get_time() - last_mouse_check > 0.5 {
+
+        let now = get_time();
+        if now - start_time < 0.5 {
+            // During initial settle time, keep updating the init pos to account for window movement
+            mouse_init_pos = mouse_position();
+        } else {
             let current_pos = mouse_position();
             if (current_pos.0 - mouse_init_pos.0).abs() > 10.0 || (current_pos.1 - mouse_init_pos.1).abs() > 10.0 {
+                #[cfg(windows)]
+                { windows_utils::restore_window(); }
+                #[cfg(not(windows))]
+                { windows_utils::restore_window(); }
+                show_mouse(true);
                 return false;
             }
         }
