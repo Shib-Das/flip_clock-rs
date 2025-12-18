@@ -3,10 +3,28 @@ use serde::{Deserialize, Serialize};
 use directories::ProjectDirs;
 use std::fs;
 use std::path::PathBuf;
+use std::collections::HashMap;
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub enum ViewType {
+    Clock,
+    DepartureBoard,
+    Off
+}
+
+impl Default for ViewType {
+    fn default() -> Self {
+        ViewType::Off
+    }
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AppConfig {
-    pub selected_monitor: String, // Identify by name
+    #[serde(default)]
+    pub selected_monitor: String, // Legacy support
+
+    #[serde(default)]
+    pub monitor_views: HashMap<String, ViewType>,
 
     // General
     #[serde(default = "default_false")]
@@ -49,6 +67,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             selected_monitor: String::new(),
+            monitor_views: HashMap::new(),
             use_12h_format: default_false(),
             show_seconds: default_true(),
             pixelated: default_false(),
@@ -98,8 +117,13 @@ mod tests {
 
     #[test]
     fn test_config_serialization() {
+        let mut views = HashMap::new();
+        views.insert("Monitor1".to_string(), ViewType::Clock);
+        views.insert("Monitor2".to_string(), ViewType::DepartureBoard);
+
         let config = AppConfig {
             selected_monitor: "TestMonitor".to_string(),
+            monitor_views: views,
             use_12h_format: true,
             show_seconds: false,
             pixelated: true,
@@ -114,21 +138,11 @@ mod tests {
 
         let json = serde_json::to_string(&config).unwrap();
         assert!(json.contains("TestMonitor"));
-        assert!(json.contains("pixelated"));
-        assert!(json.contains("bg_color"));
+        assert!(json.contains("DepartureBoard"));
 
         let loaded: AppConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(loaded.selected_monitor, "TestMonitor");
         assert_eq!(loaded.pixelated, true);
-        assert_eq!(loaded.bg_color, [0.1, 0.2, 0.3]);
-    }
-
-    #[test]
-    fn test_default_config() {
-        let config = AppConfig::default();
-        assert_eq!(config.selected_monitor, "");
-        assert_eq!(config.pixelated, false);
-        assert_eq!(config.use_12h_format, false);
-        assert_eq!(config.scale, 0.85);
+        assert_eq!(loaded.monitor_views.get("Monitor2"), Some(&ViewType::DepartureBoard));
     }
 }

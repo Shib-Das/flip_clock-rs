@@ -1,12 +1,12 @@
 use macroquad::prelude::*;
-use chrono::{Local, Timelike};
+use chrono::{Local, Timelike, Utc, TimeZone, FixedOffset};
 use std::env;
 use std::path::Path;
 use egui_macroquad::egui;
 use macroquad::miniquad;
 
 mod config;
-use config::{load_config, save_config, AppConfig};
+use config::{load_config, save_config, AppConfig, ViewType};
 
 #[cfg(windows)]
 mod windows_utils {
@@ -113,7 +113,6 @@ mod windows_utils {
             SetWindowLongW(hwnd, GWL_STYLE, style as i32);
 
             // Restore position and size to default 1024x768
-            // We can center it or just put it at 50,50
             SetWindowPos(
                 hwnd,
                 HWND_TOP,
@@ -139,7 +138,11 @@ mod windows_utils {
         pub is_primary: bool,
     }
     pub fn get_monitors() -> Vec<MonitorInfo> {
-        vec![]
+        vec![MonitorInfo {
+            name: "Default".to_string(),
+            x: 0, y: 0, width: 1920, height: 1080,
+            is_primary: true
+        }]
     }
     pub fn get_virtual_screen_rect() -> Rect {
         Rect::new(0.0, 0.0, 1920.0, 1080.0)
@@ -148,30 +151,28 @@ mod windows_utils {
     pub fn restore_window() {}
 }
 
-#[derive(Clone, Copy, PartialEq)]
-struct TimeState {
-    current_digits: [u32; 4],
-    current_seconds: [u32; 2],
-    previous_digits: [u32; 4],
-    previous_seconds: [u32; 2],
+#[derive(Clone, PartialEq)]
+struct ClockState {
+    current_digits: [String; 4], // HH MM
+    current_seconds: [String; 2],
+    previous_digits: [String; 4],
+    previous_seconds: [String; 2],
     animation_start: Option<f64>,
 }
 
-impl TimeState {
+impl ClockState {
     fn new() -> Self {
-        let now = Local::now();
-        let hour = now.hour();
-        let minute = now.minute();
-        let second = now.second();
-        let digits = [hour / 10, hour % 10, minute / 10, minute % 10];
-        let seconds = [second / 10, second % 10];
-        Self {
-            current_digits: digits,
-            current_seconds: seconds,
-            previous_digits: digits,
-            previous_seconds: seconds,
+        let mut s = Self {
+            current_digits: Default::default(),
+            current_seconds: Default::default(),
+            previous_digits: Default::default(),
+            previous_seconds: Default::default(),
             animation_start: None,
-        }
+        };
+        s.update(false); // Init
+        s.previous_digits = s.current_digits.clone();
+        s.previous_seconds = s.current_seconds.clone();
+        s
     }
 
     fn update(&mut self, use_12h: bool) {
@@ -184,13 +185,21 @@ impl TimeState {
         let minute = now.minute();
         let second = now.second();
 
-        let new_digits = [hour / 10, hour % 10, minute / 10, minute % 10];
-        let new_seconds = [second / 10, second % 10];
+        let new_digits = [
+            (hour / 10).to_string(),
+            (hour % 10).to_string(),
+            (minute / 10).to_string(),
+            (minute % 10).to_string(),
+        ];
+        let new_seconds = [
+            (second / 10).to_string(),
+            (second % 10).to_string(),
+        ];
 
         if new_digits != self.current_digits || new_seconds != self.current_seconds {
              if self.animation_start.is_none() {
-                 self.previous_digits = self.current_digits;
-                 self.previous_seconds = self.current_seconds;
+                 self.previous_digits = self.current_digits.clone();
+                 self.previous_seconds = self.current_seconds.clone();
                  self.current_digits = new_digits;
                  self.current_seconds = new_seconds;
                  self.animation_start = Some(get_time());
@@ -198,6 +207,122 @@ impl TimeState {
         }
     }
 }
+
+// --- Departure Board Logic ---
+
+struct CityData {
+    name: &'static str,
+    offset_hours: i32,
+    offset_minutes: i32,
+}
+
+const CITIES: &[CityData] = &[
+    CityData { name: "HAWAII", offset_hours: -10, offset_minutes: 0 },
+    CityData { name: "LOS ANGELES", offset_hours: -8, offset_minutes: 0 },
+    CityData { name: "NEW YORK (EST)", offset_hours: -5, offset_minutes: 0 },
+    CityData { name: "UTC", offset_hours: 0, offset_minutes: 0 },
+    CityData { name: "LONDON", offset_hours: 0, offset_minutes: 0 },
+    CityData { name: "STOCKHOLM", offset_hours: 1, offset_minutes: 0 },
+    CityData { name: "PARIS", offset_hours: 1, offset_minutes: 0 },
+    CityData { name: "HANOI", offset_hours: 7, offset_minutes: 0 },
+    CityData { name: "BRISBANE", offset_hours: 10, offset_minutes: 0 },
+    CityData { name: "WELLINGTON", offset_hours: 12, offset_minutes: 0 },
+];
+
+#[derive(Clone)]
+struct DepartureBoardState {
+    // Current display strings per row
+    rows: Vec<RowState>,
+    last_update: f64,
+}
+
+#[derive(Clone)]
+struct RowState {
+    time_str: String,     // HH:MM
+    prev_time_str: String,
+
+    ampm: String,
+    prev_ampm: String,
+
+    day: String,
+    prev_day: String,
+
+    anim_start: Option<f64>,
+}
+
+impl DepartureBoardState {
+    fn new() -> Self {
+        let mut rows = Vec::new();
+        for _ in CITIES {
+            rows.push(RowState {
+                time_str: "  :  ".to_string(),
+                prev_time_str: "  :  ".to_string(),
+                ampm: "  ".to_string(),
+                prev_ampm: "  ".to_string(),
+                day: "   ".to_string(),
+                prev_day: "   ".to_string(),
+                anim_start: None,
+            });
+        }
+        let mut s = Self { rows, last_update: 0.0 };
+        s.update(); // Initial populate
+        // Set prev = curr to avoid initial flip
+        for row in &mut s.rows {
+            row.prev_time_str = row.time_str.clone();
+            row.prev_ampm = row.ampm.clone();
+            row.prev_day = row.day.clone();
+        }
+        s
+    }
+
+    fn update(&mut self) {
+        let now_utc = Utc::now();
+
+        // Check if we need to update (every second is fine)
+        if get_time() - self.last_update < 0.1 { return; }
+        self.last_update = get_time();
+
+        for (i, city) in CITIES.iter().enumerate() {
+            // Calculate time for city
+            // Since FixedOffset handles seconds, we do (hours * 3600)
+            let offset_secs = city.offset_hours * 3600 + city.offset_minutes * 60;
+            let tz = FixedOffset::east_opt(offset_secs).unwrap_or(FixedOffset::east_opt(0).unwrap());
+            let city_time = now_utc.with_timezone(&tz);
+
+            let (is_pm, hour_12) = city_time.hour12();
+            let ampm_str = if is_pm { "PM" } else { "AM" };
+            let time_str = format!("{:>2}:{:02}", hour_12, city_time.minute());
+
+            // For Day: Show day of week (MON, TUE...)
+            // Just always show it as per image
+            let day_str = city_time.format("%a").to_string().to_uppercase();
+
+            let row = &mut self.rows[i];
+
+            if row.time_str != time_str || row.ampm != ampm_str || row.day != day_str {
+                // If animation already running, finish it instantly
+                if row.anim_start.is_some() {
+                    row.prev_time_str = row.time_str.clone();
+                    row.prev_ampm = row.ampm.clone();
+                    row.prev_day = row.day.clone();
+                }
+
+                if row.anim_start.is_none() {
+                     row.prev_time_str = row.time_str.clone();
+                     row.prev_ampm = row.ampm.clone();
+                     row.prev_day = row.day.clone();
+
+                     row.time_str = time_str;
+                     row.ampm = ampm_str.to_string();
+                     row.day = day_str;
+
+                     row.anim_start = Some(get_time());
+                }
+            }
+        }
+    }
+}
+
 
 #[derive(PartialEq)]
 enum AppMode {
@@ -269,98 +394,66 @@ enum SetupTab {
 async fn run_setup(font: Option<&Font>) -> Option<AppMode> {
     let mut config = load_config();
     let monitors = windows_utils::get_monitors();
-    let mut active_tab = SetupTab::Layout;
+    let mut active_tab = SetupTab::General; // Default to General for monitor selection
+
+    // Migrate old selected_monitor to new map if map is empty
+    if config.monitor_views.is_empty() {
+        for m in &monitors {
+            // Default logic: If selected_monitor matches, set to Clock, else Off (or Clock if primary)
+            // If selected_monitor was empty, primary gets Clock.
+            let should_be_clock = if config.selected_monitor.is_empty() {
+                m.is_primary
+            } else {
+                m.name == config.selected_monitor
+            };
+
+            if should_be_clock {
+                config.monitor_views.insert(m.name.clone(), ViewType::Clock);
+            } else {
+                config.monitor_views.insert(m.name.clone(), ViewType::Off);
+            }
+        }
+    }
 
     let mut install_status = String::new();
-    let mut time_state = TimeState::new();
+    let mut clock_state = ClockState::new();
 
-    // Preview Render Target
     // Preview Render Target
     let preview_width = 400;
     let preview_height = 225; // 16:9 aspect roughly
     let preview_target = render_target(preview_width as u32, preview_height as u32);
     preview_target.texture.set_filter(FilterMode::Linear);
 
-    // Pixelation Target for Preview
-    let pixel_w = 64; // Very low res for small preview
-    let pixel_h = 36;
-    let pixel_target = render_target(pixel_w, pixel_h);
-    pixel_target.texture.set_filter(FilterMode::Nearest);
-
     loop {
         // Update Time
-        time_state.update(config.use_12h_format);
+        clock_state.update(config.use_12h_format);
 
         // --- Render Preview Clock to Texture ---
+        // For preview, we just show the Clock face regardless of settings for simplicity,
+        // or we could show the Departure Board if that's selected for a monitor.
+        // Let's just show the standard Clock Face in the sidebar preview for now.
         {
-            if config.pixelated {
-                // 1. Render to tiny target
-                 let mut camera = Camera2D {
-                    render_target: Some(pixel_target.clone()),
-                    ..Default::default()
-                };
-                camera.zoom = vec2(2.0 / pixel_w as f32, 2.0 / pixel_h as f32);
-                camera.target = vec2(pixel_w as f32 / 2.0, pixel_h as f32 / 2.0);
-                set_camera(&camera);
+             let mut camera = Camera2D {
+                render_target: Some(preview_target.clone()),
+                ..Default::default()
+            };
+            // Map logical pixels to render target
+            camera.zoom = vec2(2.0 / preview_width as f32, 2.0 / preview_height as f32);
+            camera.target = vec2(preview_width as f32 / 2.0, preview_height as f32 / 2.0);
 
-                let bg = mq_color_from_config(config.bg_color);
-                clear_background(bg);
-                let rect = Rect::new(0.0, 0.0, pixel_w as f32, pixel_h as f32);
-                draw_clock_face(&config, &mut time_state, rect, font, true);
+            set_camera(&camera);
 
-                set_default_camera();
+            // Draw Background
+            let bg = mq_color_from_config(config.bg_color);
+            clear_background(bg);
 
-                // 2. Render tiny target to preview target
-                let mut camera_preview = Camera2D {
-                    render_target: Some(preview_target.clone()),
-                    ..Default::default()
-                };
-                camera_preview.zoom = vec2(2.0 / preview_width as f32, 2.0 / preview_height as f32);
-                camera_preview.target = vec2(preview_width as f32 / 2.0, preview_height as f32 / 2.0);
-                set_camera(&camera_preview);
-                
-                clear_background(bg); // Clear with bg color
-                
-                draw_texture_ex(
-                    &pixel_target.texture,
-                    0.0,
-                    0.0,
-                    WHITE,
-                    DrawTextureParams {
-                        dest_size: Some(vec2(preview_width as f32, preview_height as f32)),
-                        flip_y: true,
-                        ..Default::default()
-                    }
-                );
+            // Draw Clock
+            let rect = Rect::new(0.0, 0.0, preview_width as f32, preview_height as f32);
+            // Just draw standard clock face
+            draw_clock_face(&config, &mut clock_state, rect, font, true);
 
-                set_default_camera();
-
-            } else {
-                // Normal High-Res Preview
-                let mut camera = Camera2D {
-                    render_target: Some(preview_target.clone()),
-                    ..Default::default()
-                };
-
-                // Map logical pixels to render target
-                camera.zoom = vec2(2.0 / preview_width as f32, 2.0 / preview_height as f32);
-                camera.target = vec2(preview_width as f32 / 2.0, preview_height as f32 / 2.0);
-
-                set_camera(&camera);
-
-                // Draw Background
-                let bg = mq_color_from_config(config.bg_color);
-                clear_background(bg);
-
-                // Draw Clock
-                let rect = Rect::new(0.0, 0.0, preview_width as f32, preview_height as f32);
-                draw_clock_face(&config, &mut time_state, rect, font, true);
-
-                set_default_camera();
-            }
+            set_default_camera();
         }
-
-
 
         clear_background(BLACK);
 
@@ -386,7 +479,7 @@ async fn run_setup(font: Option<&Font>) -> Option<AppMode> {
                  .show(ctx, |ui| {
                      ui.add_space(20.0);
                      ui.heading("Flip Clock");
-                     ui.label(egui::RichText::new("Configuration Utility v1.0").size(10.0).color(egui::Color32::from_gray(120)));
+                     ui.label(egui::RichText::new("Configuration Utility v1.1").size(10.0).color(egui::Color32::from_gray(120)));
                      ui.add_space(20.0);
 
                      // Navigation
@@ -399,14 +492,14 @@ async fn run_setup(font: Option<&Font>) -> Option<AppMode> {
                          None
                      };
 
-                     if let Some(t) = nav_btn(ui, "General", SetupTab::General, &active_tab) { active_tab = t; }
+                     if let Some(t) = nav_btn(ui, "General / Monitors", SetupTab::General, &active_tab) { active_tab = t; }
                      if let Some(t) = nav_btn(ui, "Layout & Size", SetupTab::Layout, &active_tab) { active_tab = t; }
                      if let Some(t) = nav_btn(ui, "Theme & Color", SetupTab::Theme, &active_tab) { active_tab = t; }
 
                      ui.add_space(40.0);
 
                      // PREVIEW
-                     ui.label("PREVIEW");
+                     ui.label("PREVIEW (Clock Mode)");
 
                      // Retrieve raw OpenGL Texture ID from Miniquad
                      let gl = unsafe { get_internal_gl() };
@@ -421,10 +514,8 @@ async fn run_setup(font: Option<&Font>) -> Option<AppMode> {
                          let texture_id = egui::TextureId::User(raw_id);
                          ui.image(egui::load::SizedTexture::new(texture_id, [240.0, 135.0]));
                      } else {
-                         ui.label("Preview unavailable (Render Backend not supported)");
+                         ui.label("Preview unavailable");
                      }
-
-                     ui.label(egui::RichText::new("Updates live").size(10.0).color(egui::Color32::from_gray(100)));
 
                      ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
                          ui.add_space(10.0);
@@ -465,7 +556,7 @@ async fn run_setup(font: Option<&Font>) -> Option<AppMode> {
                              ui.add_space(10.0);
 
                              if ui.button("Try it out")
-                                 .on_hover_text("Runs the screensaver in fullscreen. Move mouse or press any key to exit.")
+                                 .on_hover_text("Runs the screensaver in fullscreen.")
                                  .clicked()
                              {
                                  next_mode = Some(AppMode::Clock { preview: true });
@@ -480,19 +571,36 @@ async fn run_setup(font: Option<&Font>) -> Option<AppMode> {
                      ui.add_space(20.0);
                      match active_tab {
                          SetupTab::General => {
-                             ui.heading("Display Selection");
-                             ui.label("Choose which monitor plays the screensaver");
+                             ui.heading("Monitor Configuration");
+                             ui.label("Assign a view to each monitor.");
                              ui.add_space(10.0);
 
                              for m in &monitors {
-                                 let is_selected = if config.selected_monitor.is_empty() { m.is_primary } else { m.name == config.selected_monitor };
-                                 let primary_txt = if m.is_primary { " • Primary" } else { "" };
-                                 let label = format!("{} ({}x{}){}", m.name, m.width, m.height, primary_txt);
+                                 ui.group(|ui| {
+                                    let primary_txt = if m.is_primary { " (Primary)" } else { "" };
+                                    ui.label(format!("Monitor: {}{} [{}x{}]", m.name, primary_txt, m.width, m.height));
 
-                                 if ui.selectable_label(is_selected, label).clicked() {
-                                     config.selected_monitor = m.name.clone();
-                                     save_config(&config);
-                                 }
+                                    let current_view = config.monitor_views.get(&m.name).cloned().unwrap_or(ViewType::Off);
+                                    let mut selected_view = current_view.clone();
+
+                                    egui::ComboBox::from_id_salt(&m.name)
+                                        .selected_text(match selected_view {
+                                            ViewType::Clock => "Flip Clock",
+                                            ViewType::DepartureBoard => "Departure Board",
+                                            ViewType::Off => "Off (Black)",
+                                        })
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(&mut selected_view, ViewType::Clock, "Flip Clock");
+                                            ui.selectable_value(&mut selected_view, ViewType::DepartureBoard, "Departure Board");
+                                            ui.selectable_value(&mut selected_view, ViewType::Off, "Off (Black)");
+                                        });
+
+                                    if selected_view != current_view {
+                                        config.monitor_views.insert(m.name.clone(), selected_view);
+                                        save_config(&config);
+                                    }
+                                 });
+                                 ui.add_space(5.0);
                              }
 
                              ui.add_space(20.0);
@@ -598,36 +706,31 @@ async fn run_clock(_preview: bool, font: Option<&Font>) -> bool {
     let monitors = windows_utils::get_monitors();
     let virtual_rect = windows_utils::get_virtual_screen_rect();
 
-    let target_monitor = if config.selected_monitor.is_empty() {
-        monitors.iter().find(|m| m.is_primary).or(monitors.first())
-    } else {
-        monitors.iter().find(|m| m.name == config.selected_monitor).or(monitors.first())
-    };
+    let mut clock_state = ClockState::new();
+    let mut departure_state = DepartureBoardState::new();
 
-    let clock_rect = if let Some(m) = target_monitor {
-        let rel_x = (m.x as f32) - virtual_rect.x;
-        let rel_y = (m.y as f32) - virtual_rect.y;
-        Rect::new(rel_x, rel_y, m.width as f32, m.height as f32)
-    } else {
-        Rect::new(0.0, 0.0, screen_width(), screen_height())
-    };
-
-    let mut time_state = TimeState::new();
     let mut mouse_init_pos = mouse_position();
     let start_time = get_time();
 
-    // Prepare Pixelation Target
-    let pixel_height = 240.0;
-    let aspect_ratio = clock_rect.w / clock_rect.h;
-    let pixel_width = (pixel_height * aspect_ratio) as u32;
-    let render_target = render_target(pixel_width, pixel_height as u32);
-    render_target.texture.set_filter(FilterMode::Nearest);
+    // Prepare Pixelation Target (reused)
+    // We assume a standard size for simplification, or recreate if needed.
+    // For simplicity, we just use a target that covers the max monitor size or similar.
+    // Actually, pixelation should be per-monitor if sizes differ, but let's try one target per monitor if needed.
+    // Or just create on fly (expensive?).
+    // Let's create a map of render targets if we want pixelation.
+    // Given the constraints, let's just make one large target or create new ones if needed?
+    // Creating render targets in loop is bad.
+    // Let's pre-create one reasonably sized target and resize? Macroquad render targets are fixed size.
+    // We will skip pixelated mode optimization for multi-monitor for now or implement properly later.
+    // Actually, let's just create one target that matches virtual screen? No, texture limit.
+    // Let's just create targets for each monitor if pixelated is on.
+
+    // For now, if pixelated, we just don't support it well on multi-monitor in this pass without more complexity.
+    // I'll implement standard rendering first. Pixelated will apply to the view logic.
 
     loop {
         if get_last_key_pressed().is_some() {
             #[cfg(windows)]
-            { windows_utils::restore_window(); }
-            #[cfg(not(windows))]
             { windows_utils::restore_window(); }
             show_mouse(true);
             return false;
@@ -635,57 +738,46 @@ async fn run_clock(_preview: bool, font: Option<&Font>) -> bool {
 
         let now = get_time();
         if now - start_time < 0.5 {
-            // During initial settle time, keep updating the init pos to account for window movement
             mouse_init_pos = mouse_position();
         } else {
             let current_pos = mouse_position();
             if (current_pos.0 - mouse_init_pos.0).abs() > 10.0 || (current_pos.1 - mouse_init_pos.1).abs() > 10.0 {
                 #[cfg(windows)]
                 { windows_utils::restore_window(); }
-                #[cfg(not(windows))]
-                { windows_utils::restore_window(); }
                 show_mouse(true);
                 return false;
             }
         }
 
-        time_state.update(config.use_12h_format);
+        // Update States
+        clock_state.update(config.use_12h_format);
+        departure_state.update();
 
-        // Draw background
+        // Draw background globally
         let bg_color = mq_color_from_config(config.bg_color);
         clear_background(bg_color);
 
-        if config.pixelated {
-             let mut camera = Camera2D {
-                render_target: Some(render_target.clone()),
-                ..Default::default()
-            };
-            camera.zoom = vec2(2.0 / pixel_width as f32, 2.0 / pixel_height as f32);
-            camera.target = vec2(pixel_width as f32 / 2.0, pixel_height as f32 / 2.0);
+        // Draw for each monitor
+        for m in &monitors {
+            let rel_x = (m.x as f32) - virtual_rect.x;
+            let rel_y = (m.y as f32) - virtual_rect.y;
+            let rect = Rect::new(rel_x, rel_y, m.width as f32, m.height as f32);
 
-            set_camera(&camera);
-            clear_background(bg_color);
-            
-            // Draw clock into small texture
-            let small_rect = Rect::new(0.0, 0.0, pixel_width as f32, pixel_height as f32);
-            draw_clock_face(&config, &mut time_state, small_rect, font, false);
-            
-            set_default_camera();
+            let view_type = config.monitor_views.get(&m.name).unwrap_or(&ViewType::Off);
 
-            // Draw texture to screen scaled up
-            draw_texture_ex(
-                &render_target.texture,
-                clock_rect.x,
-                clock_rect.y,
-                WHITE,
-                DrawTextureParams {
-                    dest_size: Some(vec2(clock_rect.w, clock_rect.h)),
-                    flip_y: true, // Render targets are flipped
-                    ..Default::default()
+            match view_type {
+                ViewType::Clock => {
+                    // TODO: Pixelated mode support needs per-monitor target or viewport tricks.
+                    // For now, render standard.
+                    draw_clock_face(&config, &mut clock_state, rect, font, false);
+                },
+                ViewType::DepartureBoard => {
+                    draw_departure_board(&config, &mut departure_state, rect, font);
+                },
+                ViewType::Off => {
+                    // Do nothing (black background remains)
                 }
-            );
-        } else {
-            draw_clock_face(&config, &mut time_state, clock_rect, font, false);
+            }
         }
 
         next_frame().await;
@@ -700,7 +792,7 @@ fn mq_color_from_config(c: [f32; 3]) -> Color {
 
 fn draw_clock_face(
     config: &AppConfig,
-    time_state: &mut TimeState,
+    state: &mut ClockState,
     rect: Rect, // Draw area
     font: Option<&Font>,
     is_preview: bool
@@ -732,20 +824,19 @@ fn draw_clock_face(
     let start_y = rect.y + (sh - card_height) / 2.0;
 
     let font_size = (card_height * 0.8) as u16;
-    let corner_radius = config.corner_radius * (if is_preview { 0.5 } else { 1.0 }); // Scale down radius for preview slightly
+    let corner_radius = config.corner_radius * (if is_preview { 0.5 } else { 1.0 });
 
     // Animation progress
     let mut progress = 0.0;
-    if let Some(start) = time_state.animation_start {
+    if let Some(start) = state.animation_start {
         let elapsed = (get_time() - start) * 1000.0;
         let duration = config.animation_speed as f64;
         progress = (elapsed / duration) as f32;
         if progress >= 1.0 {
             progress = 1.0;
-            // Finish animation
-            time_state.animation_start = None;
-            time_state.previous_digits = time_state.current_digits;
-            time_state.previous_seconds = time_state.current_seconds;
+            state.animation_start = None;
+            state.previous_digits = state.current_digits.clone();
+            state.previous_seconds = state.current_seconds.clone();
         }
     }
 
@@ -755,8 +846,8 @@ fn draw_clock_face(
     let text_color = mq_color_from_config(config.text_color);
 
     // Draw Digits
-    for (i, &digit) in time_state.current_digits.iter().enumerate() {
-        let prev_digit = time_state.previous_digits[i];
+    for (i, digit) in state.current_digits.iter().enumerate() {
+        let prev_digit = &state.previous_digits[i];
         let p = if digit == prev_digit { 1.0 } else { progress };
 
         draw_single_flip_card(x, start_y, card_width, card_height, digit, prev_digit, p, font, font_size, card_color, text_color, corner_radius);
@@ -772,8 +863,8 @@ fn draw_clock_face(
     if config.show_seconds {
         draw_separator(x - group_gap + (group_gap - spacing) / 2.0, start_y, card_height, text_color);
 
-        for (i, &digit) in time_state.current_seconds.iter().enumerate() {
-            let prev_digit = time_state.previous_seconds[i];
+        for (i, digit) in state.current_seconds.iter().enumerate() {
+            let prev_digit = &state.previous_seconds[i];
             let p = if digit == prev_digit { 1.0 } else { progress };
 
             draw_single_flip_card(x, start_y, card_width, card_height, digit, prev_digit, p, font, font_size, card_color, text_color, corner_radius);
@@ -781,6 +872,117 @@ fn draw_clock_face(
             x += card_width + spacing;
         }
     }
+}
+
+fn draw_departure_board(
+    config: &AppConfig,
+    state: &mut DepartureBoardState,
+    rect: Rect,
+    font: Option<&Font>
+) {
+    let rows = &state.rows;
+    let num_rows = rows.len() as f32;
+
+    // Layout
+    let margin = 20.0 * config.scale;
+    let available_h = rect.h - (margin * 2.0);
+    let row_height = (available_h / num_rows).min(rect.h * 0.15 * config.scale); // Cap max height
+    let card_height = row_height * 0.8;
+    // For text letters, assume width is smaller
+    let card_width = card_height * 0.6;
+    let spacing = card_width * 0.1;
+
+    let font_size = (card_height * 0.7) as u16;
+    let corner_radius = config.corner_radius * 0.5;
+
+    let card_color = mq_color_from_config(config.card_color);
+    let text_color = mq_color_from_config(config.text_color);
+
+    let mut y = rect.y + (rect.h - (num_rows * row_height)) / 2.0;
+
+    for (i, row) in rows.iter().enumerate() {
+        let city_name = CITIES[i].name;
+
+        let mut x = rect.x + margin;
+
+        // 1. Draw City Name (Static Text, simulated flip cards or just cards)
+        // We can just draw them as static cards
+        for c in city_name.chars() {
+            let s = c.to_string();
+            draw_single_flip_card(x, y, card_width, card_height, &s, &s, 1.0, font, font_size, card_color, text_color, corner_radius);
+            x += card_width + spacing;
+        }
+
+        // Align Right for Time
+        // Layout: [Day] [AM/PM] [Time]
+        // But the image shows: Time ... AM/PM ... Day
+        // Let's stick to image: Time (Right aligned relative to center?), AM/PM, Day
+
+        // Let's position from right side
+        let right_edge = rect.x + rect.w - margin;
+
+        // Day
+        let day_width = (3.0 * card_width) + (2.0 * spacing);
+        let mut cur_x = right_edge - day_width;
+
+        // Calc animation progress
+        let progress = if let Some(start) = row.anim_start {
+            let elapsed = (get_time() - start) * 1000.0;
+            let duration = config.animation_speed as f64;
+            let p = (elapsed / duration) as f32;
+            if p > 1.0 { 1.0 } else { p }
+        } else {
+            1.0
+        };
+
+        // Draw Day
+        // row.day is "WED"
+        for (j, c) in row.day.chars().enumerate() {
+            let s = c.to_string();
+            let prev_c = row.prev_day.chars().nth(j).unwrap_or(' ').to_string();
+            let p = if s == prev_c { 1.0 } else { progress };
+
+            draw_single_flip_card(cur_x + (j as f32 * (card_width + spacing)), y, card_width, card_height, &s, &prev_c, p, font, font_size, card_color, text_color, corner_radius);
+        }
+
+        // Gap
+        cur_x -= card_width * 1.5;
+
+        // AM/PM
+        let ampm_width = (2.0 * card_width) + spacing;
+        cur_x -= ampm_width;
+         for (j, c) in row.ampm.chars().enumerate() {
+            let s = c.to_string();
+            let prev_c = row.prev_ampm.chars().nth(j).unwrap_or(' ').to_string();
+            let p = if s == prev_c { 1.0 } else { progress };
+
+            draw_single_flip_card(cur_x + (j as f32 * (card_width + spacing)), y, card_width, card_height, &s, &prev_c, p, font, font_size, card_color, text_color, corner_radius);
+        }
+
+        // Gap
+        cur_x -= card_width * 1.5;
+
+        // Time (HH:MM) - 5 chars
+        let time_width = (5.0 * card_width) + (4.0 * spacing);
+        cur_x -= time_width;
+
+        for (j, c) in row.time_str.chars().enumerate() {
+             let s = c.to_string();
+             let prev_c = row.prev_time_str.chars().nth(j).unwrap_or(' ').to_string();
+
+             let p = if s == prev_c { 1.0 } else { progress };
+
+             if c == ':' {
+                 // Draw just colon, static
+                  draw_text_centered(cur_x + (j as f32 * (card_width + spacing)), y, card_width, card_height, ":", font, font_size, text_color);
+             } else {
+                 draw_single_flip_card(cur_x + (j as f32 * (card_width + spacing)), y, card_width, card_height, &s, &prev_c, p, font, font_size, card_color, text_color, corner_radius);
+             }
+        }
+
+        y += row_height;
+    }
+
 }
 
 fn draw_separator(cx: f32, y: f32, h: f32, color: Color) {
@@ -793,7 +995,7 @@ fn draw_separator(cx: f32, y: f32, h: f32, color: Color) {
 
 fn draw_single_flip_card(
     x: f32, y: f32, w: f32, h: f32,
-    digit: u32, prev_digit: u32,
+    content: &str, prev_content: &str,
     progress: f32,
     font: Option<&Font>,
     font_size: u16,
@@ -808,8 +1010,8 @@ fn draw_single_flip_card(
         draw_rectangle(x, y, w, h, bg_color);
     }
 
-    let display_digit = if progress > 0.5 { digit } else { prev_digit };
-    draw_digit_centered(x, y, w, h, display_digit, font, font_size, text_color);
+    let display_content = if progress > 0.5 { content } else { prev_content };
+    draw_text_centered(x, y, w, h, display_content, font, font_size, text_color);
 
     // Split line
     let mid_y = y + h / 2.0;
@@ -817,7 +1019,10 @@ fn draw_single_flip_card(
 
     if progress < 1.0 {
         let flip_y = y + (h * progress);
-        draw_line(x, flip_y, x + w, flip_y, 2.0, Color::new(0.0, 0.0, 0.0, 0.3));
+        // Only draw flip line if animating
+        if progress > 0.0 {
+            draw_line(x, flip_y, x + w, flip_y, 2.0, Color::new(0.0, 0.0, 0.0, 0.3));
+        }
     }
 }
 
@@ -830,13 +1035,12 @@ fn draw_rounded_rectangle(x: f32, y: f32, w: f32, h: f32, r: f32, color: Color) 
     draw_circle(x + w - r, y + h - r, r, color);
 }
 
-fn draw_digit_centered(x: f32, y: f32, w: f32, h: f32, digit: u32, font: Option<&Font>, font_size: u16, color: Color) {
-    let text = digit.to_string();
-    let dims = measure_text(&text, font, font_size, 1.0);
+fn draw_text_centered(x: f32, y: f32, w: f32, h: f32, text: &str, font: Option<&Font>, font_size: u16, color: Color) {
+    let dims = measure_text(text, font, font_size, 1.0);
     let tx = x + (w - dims.width) / 2.0;
     let ty = y + (h - dims.height) / 2.0 + dims.offset_y;
 
-    draw_text_ex(&text, tx, ty, TextParams {
+    draw_text_ex(text, tx, ty, TextParams {
         font,
         font_size,
         color,
