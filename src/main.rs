@@ -275,10 +275,17 @@ async fn run_setup(font: Option<&Font>) -> Option<AppMode> {
     let mut time_state = TimeState::new();
 
     // Preview Render Target
+    // Preview Render Target
     let preview_width = 400;
     let preview_height = 225; // 16:9 aspect roughly
     let preview_target = render_target(preview_width as u32, preview_height as u32);
     preview_target.texture.set_filter(FilterMode::Linear);
+
+    // Pixelation Target for Preview
+    let pixel_w = 64; // Very low res for small preview
+    let pixel_h = 36;
+    let pixel_target = render_target(pixel_w, pixel_h);
+    pixel_target.texture.set_filter(FilterMode::Nearest);
 
     loop {
         // Update Time
@@ -286,32 +293,74 @@ async fn run_setup(font: Option<&Font>) -> Option<AppMode> {
 
         // --- Render Preview Clock to Texture ---
         {
-            let mut camera = Camera2D {
-                render_target: Some(preview_target.clone()),
-                ..Default::default()
-            };
-
-            // Map logical pixels to render target
-            camera.zoom = vec2(2.0 / preview_width as f32, 2.0 / preview_height as f32);
-            camera.target = vec2(preview_width as f32 / 2.0, preview_height as f32 / 2.0);
-
-            set_camera(&camera);
-
-            // Draw Background
-            let bg = mq_color_from_config(config.bg_color);
-            clear_background(bg);
-
-            // Draw Clock
-            let rect = Rect::new(0.0, 0.0, preview_width as f32, preview_height as f32);
-            draw_clock_face(&config, &mut time_state, rect, font, true);
-
-            // Pixelated Overlay (simulated)
             if config.pixelated {
-                draw_rectangle(0.0, 0.0, preview_width as f32, preview_height as f32, Color::new(0.0, 0.0, 0.0, 0.2));
-            }
+                // 1. Render to tiny target
+                 let mut camera = Camera2D {
+                    render_target: Some(pixel_target.clone()),
+                    ..Default::default()
+                };
+                camera.zoom = vec2(2.0 / pixel_w as f32, 2.0 / pixel_h as f32);
+                camera.target = vec2(pixel_w as f32 / 2.0, pixel_h as f32 / 2.0);
+                set_camera(&camera);
 
-            set_default_camera();
+                let bg = mq_color_from_config(config.bg_color);
+                clear_background(bg);
+                let rect = Rect::new(0.0, 0.0, pixel_w as f32, pixel_h as f32);
+                draw_clock_face(&config, &mut time_state, rect, font, true);
+
+                set_default_camera();
+
+                // 2. Render tiny target to preview target
+                let mut camera_preview = Camera2D {
+                    render_target: Some(preview_target.clone()),
+                    ..Default::default()
+                };
+                camera_preview.zoom = vec2(2.0 / preview_width as f32, 2.0 / preview_height as f32);
+                camera_preview.target = vec2(preview_width as f32 / 2.0, preview_height as f32 / 2.0);
+                set_camera(&camera_preview);
+                
+                clear_background(bg); // Clear with bg color
+                
+                draw_texture_ex(
+                    &pixel_target.texture,
+                    0.0,
+                    0.0,
+                    WHITE,
+                    DrawTextureParams {
+                        dest_size: Some(vec2(preview_width as f32, preview_height as f32)),
+                        flip_y: true,
+                        ..Default::default()
+                    }
+                );
+
+                set_default_camera();
+
+            } else {
+                // Normal High-Res Preview
+                let mut camera = Camera2D {
+                    render_target: Some(preview_target.clone()),
+                    ..Default::default()
+                };
+
+                // Map logical pixels to render target
+                camera.zoom = vec2(2.0 / preview_width as f32, 2.0 / preview_height as f32);
+                camera.target = vec2(preview_width as f32 / 2.0, preview_height as f32 / 2.0);
+
+                set_camera(&camera);
+
+                // Draw Background
+                let bg = mq_color_from_config(config.bg_color);
+                clear_background(bg);
+
+                // Draw Clock
+                let rect = Rect::new(0.0, 0.0, preview_width as f32, preview_height as f32);
+                draw_clock_face(&config, &mut time_state, rect, font, true);
+
+                set_default_camera();
+            }
         }
+
+
 
         clear_background(BLACK);
 
@@ -364,7 +413,8 @@ async fn run_setup(font: Option<&Font>) -> Option<AppMode> {
                      let mq_tex = preview_target.texture.raw_miniquad_id();
                      let raw_id = match unsafe { gl.quad_context.texture_raw_id(mq_tex) } {
                          miniquad::RawId::OpenGl(id) => id as u64,
-                         _ => 0, // Should not happen on OpenGL platforms
+                        #[allow(unreachable_patterns)]
+                        _ => 0, // Should not happen on OpenGL platforms
                      };
 
                      if raw_id != 0 {
@@ -566,6 +616,13 @@ async fn run_clock(_preview: bool, font: Option<&Font>) -> bool {
     let mut mouse_init_pos = mouse_position();
     let start_time = get_time();
 
+    // Prepare Pixelation Target
+    let pixel_height = 240.0;
+    let aspect_ratio = clock_rect.w / clock_rect.h;
+    let pixel_width = (pixel_height * aspect_ratio) as u32;
+    let render_target = render_target(pixel_width, pixel_height as u32);
+    render_target.texture.set_filter(FilterMode::Nearest);
+
     loop {
         if get_last_key_pressed().is_some() {
             #[cfg(windows)]
@@ -598,7 +655,38 @@ async fn run_clock(_preview: bool, font: Option<&Font>) -> bool {
         let bg_color = mq_color_from_config(config.bg_color);
         clear_background(bg_color);
 
-        draw_clock_face(&config, &mut time_state, clock_rect, font, false);
+        if config.pixelated {
+             let mut camera = Camera2D {
+                render_target: Some(render_target.clone()),
+                ..Default::default()
+            };
+            camera.zoom = vec2(2.0 / pixel_width as f32, 2.0 / pixel_height as f32);
+            camera.target = vec2(pixel_width as f32 / 2.0, pixel_height as f32 / 2.0);
+
+            set_camera(&camera);
+            clear_background(bg_color);
+            
+            // Draw clock into small texture
+            let small_rect = Rect::new(0.0, 0.0, pixel_width as f32, pixel_height as f32);
+            draw_clock_face(&config, &mut time_state, small_rect, font, false);
+            
+            set_default_camera();
+
+            // Draw texture to screen scaled up
+            draw_texture_ex(
+                &render_target.texture,
+                clock_rect.x,
+                clock_rect.y,
+                WHITE,
+                DrawTextureParams {
+                    dest_size: Some(vec2(clock_rect.w, clock_rect.h)),
+                    flip_y: true, // Render targets are flipped
+                    ..Default::default()
+                }
+            );
+        } else {
+            draw_clock_face(&config, &mut time_state, clock_rect, font, false);
+        }
 
         next_frame().await;
     }
